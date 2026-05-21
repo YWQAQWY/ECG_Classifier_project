@@ -398,7 +398,7 @@ class DDATrainer:
         for x_s, y_s, _ in src_loader:
             x_s = x_s.to(self.device)
             f_s = self.encoder(x_s)
-            src_features.append(f_s.cpu().numpy())
+            src_features.append(f_s.detach().cpu().numpy())
             src_labels.append(y_s.numpy())
             if len(np.concatenate(src_features)) >= 300:
                 break
@@ -412,7 +412,7 @@ class DDATrainer:
         for x_t, y_t, _ in tgt_loader:
             x_t = x_t.to(self.device)
             f_t = self.encoder(x_t)
-            tgt_features.append(f_t.cpu().numpy())
+            tgt_features.append(f_t.detach().cpu().numpy())
             tgt_labels.append(y_t.numpy())
             if len(np.concatenate(tgt_features)) >= 300:
                 break

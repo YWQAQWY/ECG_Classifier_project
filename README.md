@@ -79,71 +79,107 @@ ECG/
 ## 数据管线 (Data Pipeline)
 
 ```
+文件: data/preprocess.py
+────────────────────────
 原始 EEG (.mat 文件)
     │  30 channels × N samples, 250Hz
+    │  _load_mat_file()     → 自动识别 v5 / v7.3(HDF5) 格式
     ▼
-┌──────────────────────────────┐
-│ Step 1: Trial 切分           │
-│  训练: 12500点/trial × 8     │
-│  测试:  2500点/trial × 8     │
-└──────────────┬───────────────┘
+┌──────────────────────────────────────┐
+│ Step 1: Trial 切分                   │
+│  split_into_trials()                 │
+│  训练: 12500点/trial × 8             │
+│  测试:  2500点/trial × 8             │
+└──────────────┬───────────────────────┘
                ▼
-┌──────────────────────────────┐
-│ Step 2: Z-score 归一化       │
-│  每通道每trial独立归一化      │
-│  x_norm = (x - μ) / σ        │
-└──────────────┬───────────────┘
+┌──────────────────────────────────────┐
+│ Step 2: Z-score 归一化               │
+│  normalize_trial()                   │
+│  每通道每trial独立归一化              │
+│  x_norm = (x - μ) / σ                │
+└──────────────┬───────────────────────┘
                ▼
-┌──────────────────────────────┐
-│ Step 3: 滑动窗口             │
-│  window=250(1s), stride=125  │
-│  训练: ~99窗口/trial          │
-│  测试: ~19窗口/trial          │
-└──────────────┬───────────────┘
+┌──────────────────────────────────────┐
+│ Step 3: 滑动窗口                     │
+│  apply_sliding_window()              │
+│  window=250(1s), stride=125(0.5s)    │
+│  训练: ~99窗口/trial                  │
+│  测试: ~19窗口/trial                  │
+└──────────────┬───────────────────────┘
                ▼
-┌──────────────────────────────┐
-│ Step 4: DE 特征提取          │
-│  4频段带通滤波 + DE计算       │
-│  DE = 0.5·log(2πeσ²)        │
-│  输出: (n_windows, 30, 4)    │
-└──────────────┬───────────────┘
+┌──────────────────────────────────────┐
+│ Step 4: DE 特征提取                  │
+│  extract_de_features()               │
+│  bandpass_filter()                   │
+│  compute_de()                        │
+│  4频段: θ(4-8) α(8-14) β(14-31)      │
+│         γ(31-45) Hz                  │
+│  DE = 0.5·log(2πeσ²)                │
+│  输出: (n_windows, 30, 4)            │
+└──────────────┬───────────────────────┘
                ▼
-        PyTorch Dataset
-        (n, 1, 30, 4) tensor
+文件: data/dataset.py
+────────────────────
+┌──────────────────────────────────────┐
+│ PyTorch Dataset 封装                  │
+│  EEGSubjectDataset / TestSubjectDataset│
+│  CrossSubjectDataLoader              │
+│  → 按被试 Leave-One-Subject-Out 划分 │
+│  输出: (batch, 1, 30, 4) tensor      │
+└──────────────┬───────────────────────┘
+               ▼
+文件: configs/config.yaml
+────────────────────────
+┌──────────────────────────────────────┐
+│ 可调参数                             │
+│  data.window_size / data.stride      │
+│  data.frequency_bands                │
+│  data.normalization                  │
+│  data.sampling_rate                  │
+└──────────────────────────────────────┘
 ```
 
 ## 模型架构 (Model Architecture)
 
 ```
+文件: models/eegnet.py  models/classifier.py
+─────────────────────────────────────────────
+
 输入: (batch, 1, 30 channels, 4 bands)
          │
     ┌────▼───────────────────────────────────┐
-    │ EEGNet Encoder (特征提取器)             │
+    │ EEGNet Encoder (eegnet.py)             │
     │                                        │
     │ Block 1: Conv2D(1→F1, kernel=1×4)     │
     │          + BN + ELU + Dropout          │
+    │          conv1, bn1                     │
     │          输出: (batch, F1, 30, 1)      │
     │                                        │
     │ Block 2: DepthwiseConv2D(F1→D·F1,     │
     │          kernel=30×1, groups=F1)       │
     │          + BN + ELU + Dropout          │
+    │          depthwise_conv, bn_depthwise   │
     │          输出: (batch, D·F1, 1, 1)     │
     │                                        │
     │ Block 3: SeparableConv2D(D·F1→F2,     │
     │          kernel=1×1)                   │
     │          + BN + ELU + Dropout          │
+    │          separable_conv, bn_separable   │
     │          输出: (batch, F2, 1, 1)       │
     │                                        │
-    │ Flatten → Linear(F2, 64)               │
+    │ Flatten → fc(Linear) → BN → ELU       │
     │          输出: (batch, 64) ← GDD/LSD  │
     │                对齐的目标特征空间       │
     └────┬───────────────────────────────────┘
          │
     ┌────▼───────────────────────────────────┐
-    │ Emotion Classifier (分类器)            │
+    │ Emotion Classifier (classifier.py)      │
     │ Dropout → Linear(64, 2)               │
     │ 输出: (batch, 2) ← emotion logits      │
     └────────────────────────────────────────┘
+
+备选: models/encoder.py → MLP Encoder (与论文一致)
+      4层MLP [512, 128, 128, 64] → 64-dim feature
 ```
 
 ## 训练流程 (Training Pipeline)
@@ -151,48 +187,51 @@ ECG/
 每个 epoch 的完整训练流程 (论文 Algorithm 1):
 
 ```
+文件: trainers/trainer.py  losses/dda_loss.py  losses/mmd.py  losses/lsd.py
+────────────────────────────────────────────────────────────────────────────
+
 ┌─────────────────────────────────────────────────────────┐
-│ Step 1: 输入数据                                        │
+│ Step 1: 输入数据              data/dataset.py           │
 │   Xs, Ys ← Source Domain (有标签)                       │
 │   Xt     ← Target Domain (无标签, 仅训练时)              │
 ├─────────────────────────────────────────────────────────┤
-│ Step 2: 编码器前向传播                                  │
+│ Step 2: 编码器前向传播         models/eegnet.py          │
 │   Fs = encoder(Xs)  → (batch_s, 64)                    │
 │   Ft = encoder(Xt)  → (batch_t, 64)                    │
 ├─────────────────────────────────────────────────────────┤
-│ Step 3: 分类器前向传播                                  │
+│ Step 3: 分类器前向传播         models/classifier.py      │
 │   Ps = classifier(Fs)  → (batch_s, 2)                  │
 │   Pt = classifier(Ft)  → (batch_t, 2)                  │
 ├─────────────────────────────────────────────────────────┤
-│ Step 4: 生成伪标签                                      │
+│ Step 4: 生成伪标签             losses/dda_loss.py        │
 │   Yt_hat = argmax(Pt)  → (batch_t,)                    │
 │   ⚠️ 伪标签不是优化变量, 随θ更新而变化                  │
 ├─────────────────────────────────────────────────────────┤
-│ Step 5: 计算 CE Loss                                   │
+│ Step 5: 计算 CE Loss           losses/dda_loss.py        │
 │   L_ce = CrossEntropy(Ps, Ys)                          │
 │   仅使用源域真实标签                                    │
 ├─────────────────────────────────────────────────────────┤
-│ Step 6: 计算 GDD Loss                                  │
-│   L_gdd = MMD(Fs, Ft)                                  │
+│ Step 6: 计算 GDD Loss          losses/mmd.py            │
+│   L_gdd = MMD(Fs, Ft)          MultiKernelMMD           │
 │   多核RBF MMD, 自适应带宽缩放                           │
 │   目标: 对齐源域和目标域的整体特征分布                    │
 ├─────────────────────────────────────────────────────────┤
-│ Step 7: 计算 LSD Loss                                  │
+│ Step 7: 计算 LSD Loss          losses/lsd.py            │
 │   L_lsd = mean(同类MMD) - mean(异类MMD)               │
 │   同类: MMD(Fs[c], Ft[c])         ← 希望小             │
 │   异类: MMD(Fs[c], Ft[c'])        ← 希望大             │
 │   使用目标域伪标签 Yt_hat 分组                          │
 ├─────────────────────────────────────────────────────────┤
-│ Step 8: 动态 α 计算                                    │
+│ Step 8: 动态 α 计算            losses/dda_loss.py        │
 │   Linear: α = 1 - epoch/N    (从1线性衰减到0)          │
 │   Sigmoid: α = σ(-epoch+100)  (论文原始S型曲线)        │
 │   初期 α≈1 → 主要优化 GDD                              │
 │   后期 α≈0 → 主要优化 LSD                              │
 ├─────────────────────────────────────────────────────────┤
-│ Step 9: 总 Loss                                        │
+│ Step 9: 总 Loss                losses/dda_loss.py        │
 │   L = L_ce + β·(α·L_gdd + (1-α)·L_lsd)               │
 ├─────────────────────────────────────────────────────────┤
-│ Step 10: 反向传播                                      │
+│ Step 10: 反向传播               trainers/trainer.py      │
 │   loss.backward()                                      │
 │   optimizer.step()                                     │
 └─────────────────────────────────────────────────────────┘
