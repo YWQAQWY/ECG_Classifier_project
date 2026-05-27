@@ -1,343 +1,192 @@
-# DDA 跨被试 EEG 情绪识别系统
+# DANN + Transformer 跨被试 EEG 情绪识别系统
 
-基于论文 *"Dynamic Domain Adaptation for Class-aware Cross-subject and Cross-session EEG Emotion Recognition"* (Li et al., IEEE JBHI 2022) 的 PyTorch 实现。
+## 方法概述
 
-## 项目概述
+基于 **Domain Adversarial Neural Network (DANN)** + **Transformer** 的跨被试 EEG 情绪识别。
 
-本项目实现了一个基于动态域适应 (Dynamic Domain Adaptation, DDA) 的跨被试 EEG 情绪识别系统，用于竞赛数据集的情绪分类 (Neutral=0, Positive=1)。
+**核心思想**: 用域对抗训练 (GRL + Domain Discriminator) 消除不同被试间的 domain shift，同时用对比学习保持 latent space 的类别结构。
 
-**核心问题**: 不同被试之间存在严重的 domain shift，需要实现跨被试泛化。
+参考: 导师代码 `DEEP_DANN_SEED.py`，将其 DANN 思路适配到竞赛 EEG 数据集。
 
 ## 项目结构
 
 ```
 ECG/
 ├── configs/
-│   └── config.yaml                 # 全局超参数配置
+│   └── config.yaml                        # 全局配置
 │
 ├── data/
-│   ├── __init__.py
-│   ├── preprocess.py               # EEG 预处理管线
-│   │   ├── Trial 切分              # 训练:12500点/trial, 测试:2500点/trial
-│   │   ├── 滑动窗口                # window=250(1s), stride=125(0.5s)
-│   │   ├── Z-score 归一化          # 每通道每trial独立归一化
-│   │   └── DE 特征提取             # θ(4-8), α(8-14), β(14-31), γ(31-45) Hz
-│   └── dataset.py                  # PyTorch Dataset + 跨被试数据划分
-│       ├── EEGSubjectDataset       # 单被试数据集
-│       ├── TestSubjectDataset      # 测试集数据集 (无标签)
-│       ├── CrossSubjectDataLoader  # 跨被试 Leave-One-Subject-Out 划分
-│       └── TestDataLoader          # 测试集加载器
+│   ├── preprocess.py                      # EEG 预处理管线
+│   │   ├── Trial 切分 + 降采样 + 滑动窗口
+│   │   ├── 每被试独立 Z-score 归一化 (防泄漏)
+│   │   └── DE 特征提取 (θ/α/β/γ 4频段)
+│   └── dataset.py                         # PyTorch Dataset + LOSO 划分
+│       ├── EEGDataset                     # 含 domain label (0=source, 1=target)
+│       ├── CrossSubjectDataLoader.folds() # 留一法 / K折交叉验证
+│       └── TestDataLoader                 # 测试集加载
 │
 ├── models/
-│   ├── __init__.py
-│   ├── eegnet.py                   # EEGNet 编码器 (特征提取)
-│   │   └── Conv2D → DepthwiseConv2D → SeparableConv2D → FC → 64-dim feature
-│   ├── encoder.py                  # MLP 编码器 (备选, 与论文一致)
-│   │   └── 4层MLP: [512, 128, 128, 64] → 64-dim feature
-│   └── classifier.py               # 线性分类器 head
-│       └── Linear(64, 2) → emotion logits
+│   ├── transformer_encoder.py             # 共享 Transformer 编码器 F
+│   │   └── 输入(30 tokens×4 dims) → PosEnc → 3×Self-Attn → z(64-dim)
+│   ├── classifier.py                      # 分支 C: 情绪分类器 (CE loss)
+│   ├── domain_discriminator.py            # 分支 D: GRL + 域判别器 (对抗)
+│   │   └── GradReverse (前向恒等, 反向梯度×(-λ))
+│   └── contrastive_head.py                # 分支 Con: 对比学习头 (L2 norm)
 │
 ├── losses/
-│   ├── __init__.py
-│   ├── mmd.py                      # 多核 RBF MMD (最大均值差异)
-│   │   └── MultiKernelMMD: 多带宽高斯核 + 自适应中位距离缩放
-│   ├── lsd.py                      # LSD (局部子域差异)
-│   │   └── LocalSubdomainDiscrepancy: 类条件MMD (同类拉近, 异类推远)
-│   └── dda_loss.py                 # DDA 总损失 (CE + GDD + LSD + Dynamic α)
-│       └── DDALoss: 集成所有损失 + 动态α调度 + 伪标签生成
+│   ├── contrastive_loss.py                # InfoNCE 对比损失 (内积相似度)
+│   └── dann_loss.py                       # 组合损失: CE + λd·Domain + λc·Contrastive
+│
+├── ensemble/
+│   └── pseudo_labeler.py                  # 集成伪标签 (SVM+RF+MLP+LR 全票通过)
 │
 ├── trainers/
-│   ├── __init__.py
-│   ├── trainer.py                  # DDA 训练器 (核心训练循环)
-│   │   ├── train_epoch()           # 单epoch训练: CE+GDD+LSD+α 联合优化
-│   │   ├── train_fold()            # 单fold训练+验证+保存
-│   │   └── visualize_features()    # t-SNE 特征可视化
-│   └── evaluator.py                # 模型评估器
-│       ├── evaluate()              # 目标域 accuracy/F1/confusion matrix
-│       ├── predict()               # 测试集推理
-│       └── extract_features()      # 特征提取 (用于t-SNE)
-│
-├── utils/
-│   ├── __init__.py
-│   ├── seed.py                     # 随机种子固定 (保证可复现)
-│   ├── logger.py                   # TensorBoard + 控制台日志
-│   ├── metrics.py                  # Accuracy, F1, Confusion Matrix
-│   └── visualization.py            # t-SNE 特征可视化 + 训练曲线 + 混淆矩阵
+│   └── trainer.py                         # DANN 训练循环 + 周期集成更新
 │
 ├── scripts/
-│   ├── __init__.py
-│   ├── train.py                    # 训练入口 (Leave-One-Subject-Out CV)
-│   ├── train_ablation.py           # 消融实验 (CE-only / CE+GDD / CE+GDD+LSD)
-│   └── test.py                     # 测试集推理
+│   ├── train.py                           # LOSO 训练入口
+│   └── test.py                            # 测试集推理
 │
-├── checkpoints/                    # 模型保存目录
-├── logs/                           # TensorBoard 日志目录
-├── venv/                           # Python 虚拟环境
-└── README.md                       # 本文件
+└── utils/                                 # seed / logger / metrics / visualization
 ```
 
-## 数据管线 (Data Pipeline)
+## 网络架构
+
+```
+                         ┌─────────────────────────┐
+  Source EEG (30,4) ────►│                         │
+                         │  Shared Transformer F   │
+  Target EEG (30,4) ────►│  3 layers, 4 heads      │
+                         │  Pre-LN, d_model=64     │
+                         └───────────┬─────────────┘
+                                     │ z (batch, 64)
+                     ┌───────────────┼───────────────┐
+                     ▼               ▼               ▼
+              ┌──────────┐  ┌──────────────┐  ┌──────────┐
+              │ Branch C │  │  Branch D    │  │ Branch Con│
+              │Classifier│  │  GRL + Disc  │  │ L2 Norm  │
+              │64→32→2  │  │  64→32→2     │  │ (no param)│
+              └────┬─────┘  └──────┬───────┘  └────┬─────┘
+                   │               │               │
+              L_cls (CE)   L_domain (CE)    L_con (InfoNCE)
+              source only   source+target    source+target
+```
+
+**三个并列分支共同约束 Transformer:**
+- **C**: emotion-discriminative (情绪可判别)
+- **D**: domain-invariant (域不变，对抗训练)
+- **Con**: contrastively-structured (类结构约束，同类聚/异类分)
+
+## 数据管线
 
 ```
 文件: data/preprocess.py
 ────────────────────────
-原始 EEG (.mat 文件)
-    │  30 channels × N samples, 250Hz
-    │  _load_mat_file()     → 自动识别 v5 / v7.3(HDF5) 格式
-    ▼
-┌──────────────────────────────────────┐
-│ Step 1: Trial 切分                   │
-│  split_into_trials()                 │
-│  训练: 12500点/trial × 8             │
-│  测试:  2500点/trial × 8             │
-└──────────────┬───────────────────────┘
-               ▼
-┌──────────────────────────────────────┐
-│ Step 2: Z-score 归一化               │
-│  normalize_trial()                   │
-│  每通道每trial独立归一化              │
-│  x_norm = (x - μ) / σ                │
-└──────────────┬───────────────────────┘
-               ▼
-┌──────────────────────────────────────┐
-│ Step 3: 滑动窗口                     │
-│  apply_sliding_window()              │
-│  window=250(1s), stride=125(0.5s)    │
-│  训练: ~99窗口/trial                  │
-│  测试: ~19窗口/trial                  │
-└──────────────┬───────────────────────┘
-               ▼
-┌──────────────────────────────────────┐
-│ Step 4: DE 特征提取                  │
-│  extract_de_features()               │
-│  bandpass_filter()                   │
-│  compute_de()                        │
-│  4频段: θ(4-8) α(8-14) β(14-31)      │
-│         γ(31-45) Hz                  │
-│  DE = 0.5·log(2πeσ²)                │
-│  输出: (n_windows, 30, 4)            │
-└──────────────┬───────────────────────┘
-               ▼
-文件: data/dataset.py
-────────────────────
-┌──────────────────────────────────────┐
-│ PyTorch Dataset 封装                  │
-│  EEGSubjectDataset / TestSubjectDataset│
-│  CrossSubjectDataLoader              │
-│  → 按被试 Leave-One-Subject-Out 划分 │
-│  输出: (batch, 1, 30, 4) tensor      │
-└──────────────┬───────────────────────┘
-               ▼
-文件: configs/config.yaml
-────────────────────────
-┌──────────────────────────────────────┐
-│ 可调参数                             │
-│  data.window_size / data.stride      │
-│  data.frequency_bands                │
-│  data.normalization                  │
-│  data.sampling_rate                  │
-└──────────────────────────────────────┘
+
+.mat 文件 → Trial 切分 (train:12500/test:2500)
+  → 降采样 (downsample_ratio=0.5, 每被试随机保留)
+  → 滑动窗口 (window=250, stride=125)
+  → DE 特征 (bandpass + DE=0.5·log(2πeσ²))
+  → 每被试独立 Z-score 归一化 (防数据泄漏)
+  → 输出 (n_windows, 30 channels, 4 bands)
 ```
 
-## 模型架构 (Model Architecture)
+## 训练流程
 
 ```
-文件: models/eegnet.py  models/classifier.py
-─────────────────────────────────────────────
+文件: trainers/trainer.py  losses/dann_loss.py
+────────────────────────────────────────────────
 
-输入: (batch, 1, 30 channels, 4 bands)
-         │
-    ┌────▼───────────────────────────────────┐
-    │ EEGNet Encoder (eegnet.py)             │
-    │                                        │
-    │ Block 1: Conv2D(1→F1, kernel=1×4)     │
-    │          + BN + ELU + Dropout          │
-    │          conv1, bn1                     │
-    │          输出: (batch, F1, 30, 1)      │
-    │                                        │
-    │ Block 2: DepthwiseConv2D(F1→D·F1,     │
-    │          kernel=30×1, groups=F1)       │
-    │          + BN + ELU + Dropout          │
-    │          depthwise_conv, bn_depthwise   │
-    │          输出: (batch, D·F1, 1, 1)     │
-    │                                        │
-    │ Block 3: SeparableConv2D(D·F1→F2,     │
-    │          kernel=1×1)                   │
-    │          + BN + ELU + Dropout          │
-    │          separable_conv, bn_separable   │
-    │          输出: (batch, F2, 1, 1)       │
-    │                                        │
-    │ Flatten → fc(Linear) → BN → ELU       │
-    │          输出: (batch, 64) ← GDD/LSD  │
-    │                对齐的目标特征空间       │
-    └────┬───────────────────────────────────┘
-         │
-    ┌────▼───────────────────────────────────┐
-    │ Emotion Classifier (classifier.py)      │
-    │ Dropout → Linear(64, 2)               │
-    │ 输出: (batch, 2) ← emotion logits      │
-    └────────────────────────────────────────┘
+每 batch:
+  Source B ──► Transformer F ──► z_s
+                                     ├──► C ──► L_cls (CE, source only)
+                                     ├──► GRL+D ──► L_domain (source vs target)
+                                     └──► Con ──► L_con (同类近/异类远)
 
-备选: models/encoder.py → MLP Encoder (与论文一致)
-      4层MLP [512, 128, 128, 64] → 64-dim feature
+  Target B ──► Transformer F ──► z_t  (共享F, 同上三个分支)
+
+  L_total = λ_cls*L_cls + λ_domain*L_domain + λ_con*L_con
+  (λ_cls=1.0, λ_domain=0.1, λ_con=0.05)
+
+周期集成伪标签:
+  每 10 epoch → SVM+RF+MLP+LR 训练 → 目标域投票
+  → 全票通过 → 加入源域训练集
 ```
 
-## 训练流程 (Training Pipeline)
+## 评估方法: 留一法 (LOSO)
 
-每个 epoch 的完整训练流程 (论文 Algorithm 1):
+### 哪些模块使用 LOSO?
+
+| 文件 | 函数/类 | 作用 |
+|------|---------|------|
+| `data/dataset.py:94` | `CrossSubjectDataLoader.folds()` | 生成 LOSO 划分 |
+| `scripts/train.py:98` | `main()` 训练循环 | 遍历每折, 训练+评估 |
+| `configs/config.yaml` | `data.n_folds: 0` | 0 = 真正留一法 |
+
+### LOSO 流程
 
 ```
-文件: trainers/trainer.py  losses/dda_loss.py  losses/mmd.py  losses/lsd.py
-────────────────────────────────────────────────────────────────────────────
+n_folds=0 → 真正留一法:
 
-┌─────────────────────────────────────────────────────────┐
-│ Step 1: 输入数据              data/dataset.py           │
-│   Xs, Ys ← Source Domain (有标签)                       │
-│   Xt     ← Target Domain (无标签, 仅训练时)              │
-├─────────────────────────────────────────────────────────┤
-│ Step 2: 编码器前向传播         models/eegnet.py          │
-│   Fs = encoder(Xs)  → (batch_s, 64)                    │
-│   Ft = encoder(Xt)  → (batch_t, 64)                    │
-├─────────────────────────────────────────────────────────┤
-│ Step 3: 分类器前向传播         models/classifier.py      │
-│   Ps = classifier(Fs)  → (batch_s, 2)                  │
-│   Pt = classifier(Ft)  → (batch_t, 2)                  │
-├─────────────────────────────────────────────────────────┤
-│ Step 4: 生成伪标签             losses/dda_loss.py        │
-│   Yt_hat = argmax(Pt)  → (batch_t,)                    │
-│   ⚠️ 伪标签不是优化变量, 随θ更新而变化                  │
-├─────────────────────────────────────────────────────────┤
-│ Step 5: 计算 CE Loss           losses/dda_loss.py        │
-│   L_ce = CrossEntropy(Ps, Ys)                          │
-│   仅使用源域真实标签                                    │
-├─────────────────────────────────────────────────────────┤
-│ Step 6: 计算 GDD Loss          losses/mmd.py            │
-│   L_gdd = MMD(Fs, Ft)          MultiKernelMMD           │
-│   多核RBF MMD, 自适应带宽缩放                           │
-│   目标: 对齐源域和目标域的整体特征分布                    │
-├─────────────────────────────────────────────────────────┤
-│ Step 7: 计算 LSD Loss          losses/lsd.py            │
-│   L_lsd = mean(同类MMD) - mean(异类MMD)               │
-│   同类: MMD(Fs[c], Ft[c])         ← 希望小             │
-│   异类: MMD(Fs[c], Ft[c'])        ← 希望大             │
-│   使用目标域伪标签 Yt_hat 分组                          │
-├─────────────────────────────────────────────────────────┤
-│ Step 8: 动态 α 计算            losses/dda_loss.py        │
-│   Linear: α = 1 - epoch/N    (从1线性衰减到0)          │
-│   Sigmoid: α = σ(-epoch+100)  (论文原始S型曲线)        │
-│   初期 α≈1 → 主要优化 GDD                              │
-│   后期 α≈0 → 主要优化 LSD                              │
-├─────────────────────────────────────────────────────────┤
-│ Step 9: 总 Loss                losses/dda_loss.py        │
-│   L = L_ce + β·(α·L_gdd + (1-α)·L_lsd)               │
-├─────────────────────────────────────────────────────────┤
-│ Step 10: 反向传播               trainers/trainer.py      │
-│   loss.backward()                                      │
-│   optimizer.step()                                     │
-└─────────────────────────────────────────────────────────┘
+  Subject 1 做 Target, Subject 2~60 做 Source → 训练 → 评估 Acc₁
+  Subject 2 做 Target, Subject 1,3~60 做 Source → 训练 → 评估 Acc₂
+  ...
+  Subject 60 做 Target, Subject 1~59 做 Source → 训练 → 评估 Acc₆₀
+
+最终: Mean ± Std (60个被试的目标域准确率)
 ```
 
-## DDA 核心理论
+### K-Fold 模式
 
-### 1. CE (Cross Entropy)
-- **作用**: 学习情绪分类边界
-- **数据**: 仅使用源域真实标签
-- **公式**: `L_ce = -(1/n) Σ y_i·log(P_θ(ŷ_i|x_i))`
+```
+n_folds=5 → 5折交叉验证 (快速调试用):
 
-### 2. GDD (Global Domain Distribution Alignment)
-- **作用**: 对齐源域和目标域的整体特征分布
-- **实现**: 多核 RBF MMD
-- **公式**: `L_gdd = MMD(Fs, Ft)`
-- **局限**: 仅对齐整体分布可能导致类别混合
-
-### 3. LSD (Local Subdomain Alignment)
-- **作用**: 类别级精细对齐 (同类拉近, 异类推远)
-- **实现**: 类条件 MMD + 伪标签
-- **公式**: `L_lsd = mean(同类MMD) - mean(异类MMD)`
-
-### 4. Dynamic α Schedule (论文灵魂)
-- **初期** (α≈1): 伪标签不可靠 → 主要优化 GDD
-- **后期** (α≈0): 伪标签变可靠 → 主要优化 LSD
-- **粗到细**: GDD (域级粗对齐) → LSD (类别级细对齐)
-
-### 5. Pseudo Label Update (EM 思想)
-- 每轮动态更新伪标签 Yt_hat = argmax(Pt)
-- θ → features → predictions → pseudo labels (自然更新)
-- EM: E步估计隐变量(伪标签) → M步更新参数(θ) → 交替迭代 → 收敛
+  60个被试随机分为5组, 每组取第1个做 Target
+  跑5折, 每折1个 target subject
+```
 
 ## 使用方法
 
-### 环境配置
-
 ```bash
 cd /home/yanwq/ECG
-python3 -m venv venv
 source venv/bin/activate
-pip install numpy scipy torch scikit-learn matplotlib pyyaml tensorboard
-```
 
-### 训练
-
-```bash
-# 完整训练 (Leave-One-Subject-Out 交叉验证)
-python -m scripts.train --config configs/config.yaml
-
-# 调试模式 (少被试, 少epoch)
+# 调试模式 (3折, 20 epoch, ~5分钟)
 python -m scripts.train --config configs/config.yaml --debug
 
-# 指定实验模式
-python -m scripts.train --mode ce_gdd_lsd
+# 完整 LOSO (60折, 100 epoch, 耗时长)
+python -m scripts.train --config configs/config.yaml
+
+# 测试集推理
+python -m scripts.test --checkpoint checkpoints/best_dann_fold0.pth --output predictions.csv
 ```
 
-### 消融实验
-
-```bash
-# 对比 CE-only / CE+GDD / CE+GDD+LSD
-python -m scripts.train_ablation --config configs/config.yaml
-```
-
-### 测试集推理
-
-```bash
-python -m scripts.test \
-    --config configs/config.yaml \
-    --checkpoint checkpoints/final_model.pth \
-    --output predictions.csv
-```
-
-### 查看 TensorBoard
-
-```bash
-tensorboard --logdir logs/
-```
-
-## 数据集
-
-- **训练集**: 40名健康 + 20名抑郁症被试
-- **测试集**: 5名健康 + 5名抑郁症被试
-- **EEG**: 30通道, 250Hz
-- **标签**: Neutral=0, Positive=1
-- **数据路径**: `赛题四数据集及说明文档/`
-
-## 参考文献
-
-Li, Z., Zhu, E., Jin, M., Fan, C., He, H., Cai, T., & Li, J. (2022). Dynamic Domain Adaptation for Class-aware Cross-subject and Cross-session EEG Emotion Recognition. *IEEE Journal of Biomedical and Health Informatics*, 26(12), 5964-5974.
-
-## 配置说明
-
-主要超参数 (见 `configs/config.yaml`):
+## 关键超参数
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `dda.beta` | 0.1 | 对齐损失权重 |
-| `dda.alpha_schedule` | linear | α衰减策略 (linear/sigmoid) |
-| `dda.mmd.bandwidths` | [0.5,1,2,4,8,16] | MMD多核带宽 |
-| `dda.lsd.confidence_threshold` | 0.7 | LSD伪标签置信度阈值 |
-| `training.epochs` | 200 | 训练轮数 |
-| `training.batch_size` | 64 | 批大小 |
-| `training.learning_rate` | 0.001 | 学习率 |
-| `model.eegnet.F1` | 8 | EEGNet时间滤波器数 |
-| `model.eegnet.D` | 2 | 深度乘子 |
-| `data.window_size` | 250 | 滑动窗口大小 (1秒) |
-| `data.stride` | 125 | 滑动步长 (0.5秒) |
-# ECG_Classifier_project
+| `data.downsample_ratio` | 0.5 | 降采样比例 |
+| `data.n_folds` | 0 | 0=LOSO, N=K折 |
+| `transformer.d_model` | 64 | Transformer 隐层维度 |
+| `transformer.n_layers` | 3 | Transformer 层数 |
+| `transformer.n_heads` | 4 | 注意力头数 |
+| `loss_weights.cls` | 1.0 | CE 分类损失权重 |
+| `loss_weights.domain` | 0.1 | 域对抗损失权重 |
+| `loss_weights.contrastive` | 0.05 | 对比学习损失权重 |
+| `contrastive.temperature` | 0.1 | 对比学习温度 |
+| `ensemble.enabled` | true | 是否启用集成伪标签 |
+| `training.learning_rate` | 5e-4 | 学习率 |
+| `training.batch_size` | 128 | 批大小 |
+
+## 与导师代码的对应关系
+
+| 导师代码 DEEP_DANN_SEED.py | 本项目 |
+|---|---|
+| `GradReverse` | `models/domain_discriminator.py:GradReverse` |
+| `SingleModalityFeatureExtractor` (MLP) | `models/transformer_encoder.py:TransformerEncoder` |
+| `classifier` (128→64→2) | `models/classifier.py:EmotionClassifier` (64→32→2) |
+| `domain_discriminator` (128→64→N) | `models/domain_discriminator.py:DomainDiscriminator` (64→32→2) |
+| `total_loss = cls + 0.1*domain + constraint` | `losses/dann_loss.py` (CE + 0.1*Domain + 0.05*Con) |
+| `ModalityMaskEnhancement` | 未采用 (用降采样+对比学习替代) |
+| SEED 多模态 (EEG+EYE) | 竞赛 EEG 单模态 |
+| Leave-One-Subject-Out (for loop) | `CrossSubjectDataLoader.folds()` LOSO |

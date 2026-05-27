@@ -1,66 +1,49 @@
 """
-情绪分类器
-========
+分支 C: 情绪分类器
+=================
 
-线性分类器 head，将编码器提取的特征映射到情绪类别。
+接收 Transformer 输出特征 z，预测情绪类别 (neutral=0, positive=1)。
 
-论文中的分类器:
-    "The emotion classifier is a linear layer whose nodes correspond to
-     the emotion categories."
+该分支只使用 Source 域的情绪标签计算监督分类损失:
+    L_cls = CE(C(z_s), y_s)
+
+作用: 保证 Transformer 输出特征中保留足够的情绪判别信息，
+      避免模型只做域对齐而丢失情绪分类能力。
+
+结构 (参考导师代码 classifier):
+    z (d_model) → Linear → ReLU → Dropout → Linear → 2 classes
 """
 
-import torch
 import torch.nn as nn
 
 
 class EmotionClassifier(nn.Module):
-    """
-    线性分类器 — 将特征映射到情绪类别概率。
+    """情绪分类头 — 分支 C"""
 
-    输入: 特征向量 (batch, feature_dim)
-    输出: 类别logits (batch, n_classes)
+    def __init__(self, input_dim: int = 64, hidden_dims: list = None,
+                 n_classes: int = 2, dropout: float = 0.3):
+        super().__init__()
+        if hidden_dims is None:
+            hidden_dims = [64, 32]
 
-    为什么使用简单的线性分类器?
-    - 特征提取能力由编码器负责
-    - 线性分类器参数少, 不易过拟合
-    - 论文明确使用 "a linear layer"
-    - 简单的分类器使域对齐效果更容易归因于特征层面
-    """
+        layers = []
+        prev = input_dim
+        for hd in hidden_dims:
+            layers.extend([
+                nn.Linear(prev, hd),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+            ])
+            prev = hd
+        layers.append(nn.Linear(prev, n_classes))
 
-    def __init__(self, feature_dim: int = 64, n_classes: int = 2,
-                 dropout_rate: float = 0.3):
+        self.classifier = nn.Sequential(*layers)
+
+    def forward(self, z):
         """
         参数:
-            feature_dim: 编码器输出的特征维度 (默认64)
-            n_classes: 类别数 (2: neutral/positive)
-            dropout_rate: Dropout比率
-        """
-        super(EmotionClassifier, self).__init__()
-
-        self.classifier = nn.Sequential(
-            nn.Dropout(dropout_rate),
-            nn.Linear(feature_dim, n_classes)
-        )
-
-        # 初始化
-        self._initialize_weights()
-
-    def _initialize_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
-        """
-        前向传播。
-
-        参数:
-            features: 特征向量 (batch, feature_dim) — 编码器输出
-
+            z: Transformer 输出特征 (batch, d_model)
         返回:
-            logits: 未归一化的类别分数 (batch, n_classes)
-                    使用 CrossEntropyLoss 时不需要提前做 softmax
+            logits: 类别 logits (batch, n_classes)
         """
-        return self.classifier(features)
+        return self.classifier(z)

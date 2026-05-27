@@ -1,27 +1,24 @@
 # ============================================================
-# DDA (Dynamic Domain Adaptation) 跨被试EEG情绪识别 - 配置文件
-# 论文: Dynamic Domain Adaptation for Class-aware Cross-subject
-#       and Cross-session EEG Emotion Recognition (JBHI 2022)
+# DANN + Transformer 跨被试 EEG 情绪识别 - 配置文件
+# 架构: 共享Transformer F + 三个并列分支 (C / GRL+D / Con)
+# 参考: DEEP_DANN_SEED.py (导师代码)
 # ============================================================
 
 # 数据配置
 data:
-  # 原始数据路径
   train_root: "./赛题四数据集及说明文档/训练集"
   test_root: "./赛题四数据集及说明文档/公开测试集"
 
-  # EEG参数
-  sampling_rate: 250          # 采样率 (Hz)
-  n_channels: 30              # 通道数
+  sampling_rate: 250
+  n_channels: 30
 
-  # 训练集 trial 切分: 12500 samples/trial (50秒 × 250Hz)
+  # 训练集 trial 切分
   train_trial_length: 12500
-  # 测试集 trial 切分: 2500 samples/trial (10秒 × 250Hz)
   test_trial_length: 2500
 
   # 滑动窗口参数
-  window_size: 250            # 窗口大小 (1秒)
-  stride: 125                 # 步长 (0.5秒, 50%重叠)
+  window_size: 250
+  stride: 125
 
   # DE 特征频段定义 (Hz)
   frequency_bands:
@@ -30,100 +27,80 @@ data:
     beta: [14, 31]
     gamma: [31, 45]
 
-  # 预处理
-  normalization: "zscore"     # z-score 归一化
-  # 是否重新计算预处理 (如果已有processed数据则跳过)
-  force_recompute: false
+  # 降采样: 每个被试随机保留的比例 (减少冗余)
+  downsample_ratio: 0.5
 
-# 模型配置
-model:
-  name: "eegnet"              # 编码器类型: eegnet / mlp
+  # 归一化: z-score (每个被试独立)
+  normalization: "zscore"
 
-  # EEGNet 参数
-  eegnet:
-    F1: 8                     # 第一个卷积层的滤波器数 (时间卷积)
-    D: 2                      # 深度乘子
-    F2: 16                    # 深度可分离卷积的滤波器数
-    dropout_rate: 0.5
-    # 输入: (batch, 1, n_channels=30, n_bands*time_steps) -- 当作2D特征图
-    kernel_temporal: 64       # 时间卷积核大小 (约250ms, 64/250Hz)
-    kernel_depthwise: 16      # 深度卷积核大小 (通道维度)
+  # 留一法交叉验证 (0=真正留一法, 每个被试轮流做target)
+  n_folds: 0
 
-  # MLP 参数 (备选编码器，与论文一致)
-  mlp:
-    hidden_dims: [512, 128, 128, 64]
-    dropout_rate: 0.5
+# Transformer 编码器配置
+transformer:
+  # 输入: 30 tokens (channels) × 4 dims (bands)
+  token_dim: 4                  # 每个 token 的维度 (4个频段的DE)
+  n_tokens: 30                  # token 数量 (30通道)
+  d_model: 64                   # Transformer 隐层维度
+  n_heads: 4                    # 多头注意力头数
+  n_layers: 3                   # Transformer 层数
+  dim_feedforward: 256           # FFN 隐层维度
+  dropout: 0.1                   # Transformer dropout
+  # 输出: z (batch, d_model=64)
 
-  # 分类器
-  classifier:
-    feature_dim: 64           # 编码器输出的特征维度
-    n_classes: 2              # neutral=0, positive=1
+# 分支 C: 情绪分类器
+classifier:
+  hidden_dims: [64, 32]         # z(64) → 64 → 32 → 2
+  n_classes: 2
+  dropout: 0.3
+
+# 分支 D: 域判别器 (GRL + D)
+domain_discriminator:
+  hidden_dims: [64, 32]         # GRL(z) → 64 → 32 → 2
+  n_domains: 2                  # source=0, target=1
+  dropout: 0.3
+  grl_lambda: 1.0               # GRL 梯度反转系数
+
+# 分支 Con: 对比学习
+contrastive:
+  temperature: 0.1              # 对比学习温度
+  # 使用内积相似度: s = z_i^T z_j (L2 normalized)
+
+# 集成伪标签
+ensemble:
+  enabled: true                 # 是否启用集成伪标签
+  confidence_threshold: 0.8     # 全票通过阈值
+  add_to_source_percent: 0.3    # 每次最多加入源域的伪标签比例
+  update_interval: 10           # 每N个epoch更新一次伪标签
 
 # 训练配置
 training:
-  # 跨被试验证: leave-one-subject-out
-  n_folds: 5                  # 留出被试交叉验证折数 (0表示用全部数据)
-
-  # 优化器
   optimizer: "adam"
-  learning_rate: 0.001
-  weight_decay: 0.0001        # L2 正则化
+  learning_rate: 5e-4           # 参考导师代码
+  weight_decay: 1e-4
 
-  # 训练参数
-  epochs: 200
-  batch_size: 64
+  epochs: 100
+  batch_size: 256               # 增大batch提升对比学习效果
 
-  # 学习率调度
-  lr_scheduler: "cosine"      # cosine / step / none
-  lr_step_size: 50
-  lr_gamma: 0.5
+  # 学习率调度 (参考导师: StepLR gamma=0.99)
+  lr_scheduler: "step"
+  lr_step_size: 10
+  lr_gamma: 0.99
 
-  # 设备
-  device: "cuda"              # cuda / cpu
+  device: "cuda"
 
-# DDA 特定配置
-dda:
-  # β: 对齐损失权重 (控制 GDD+LSD 相对于 CE 的重要性)
-  beta: 0.1
-
-  # α 衰减策略: linear / sigmoid
-  # - linear: α = 1 - epoch/N  (简单稳定)
-  # - sigmoid: α = exp(-epoch+100) / (1+exp(-epoch+100))  (论文原始)
-  alpha_schedule: "linear"
-
-  # MMD 核参数
-  mmd:
-    kernel: "multi_rbf"       # rbf / multi_rbf
-    # 多核 RBF 的带宽列表 (multiplied by median pairwise distance)
-    bandwidths: [0.5, 1.0, 2.0, 4.0, 8.0, 16.0]
-
-  # LSD 参数
-  lsd:
-    # 伪标签置信度阈值 (低于此阈值的伪标签不用于LSD计算)
-    confidence_threshold: 0.7
-    # 每个类别最少样本数 (低于此数值的类别跳过LSD计算)
-    min_samples_per_class: 3
-
-  # 伪标签更新策略
-  pseudo_label:
-    # 是否使用置信度阈值过滤
-    use_threshold: true
-    # 是否使用温度缩放 (软化/锐化预测分布)
-    temperature: 1.0
+# 损失权重
+loss_weights:
+  cls: 1.0                      # 分类损失权重
+  domain: 0.1                   # 域对抗损失权重 (参考导师代码)
+  contrastive: 0.05             # 对比学习损失权重
 
 # 实验配置
 experiment:
-  name: "dda_eeg_emotion"
+  name: "dann_transformer_eeg"
   seed: 42
 
-  # 消融实验模式: ce_only / ce_gdd / ce_gdd_lsd (完整DDA)
-  mode: "ce_gdd_lsd"
-
-  # 保存与日志
   save_dir: "./checkpoints"
   log_dir: "./logs"
-  log_interval: 10           # 每N个batch打印一次日志
-  eval_interval: 1           # 每N个epoch验证一次
-
-  # 可视化
-  viz_samples: 200           # t-SNE 可视化采样数
+  log_interval: 10
+  eval_interval: 1
