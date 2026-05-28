@@ -1,0 +1,11 @@
+Subject,Trial1,Trial2,Trial3,Trial4,Trial5,Trial6,Trial7,Trial8
+P_test1,0,0,1,0,1,0,1,0
+P_test10,1,1,1,1,0,1,0,0
+P_test2,1,1,1,1,1,0,0,0
+P_test3,1,1,0,0,1,0,0,1
+P_test4,0,0,1,0,1,1,1,0
+P_test5,1,0,0,1,0,0,1,0
+P_test6,1,0,0,0,1,0,0,1
+P_test7,1,1,1,0,0,0,1,1
+P_test8,1,1,0,0,0,1,0,0
+P_test9,0,1,1,0,0,1,0,1
