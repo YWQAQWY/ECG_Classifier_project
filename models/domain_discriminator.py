@@ -18,8 +18,6 @@ D (域判别器):
 
 目标: 不是让 D 分类准确，而是通过 D 与 GRL 的对抗，
       使 F 学习到源域和目标域通用的特征表示。
-
-参考: 导师代码 DEEP_DANN_SEED.py 的 GradReverse + domain_discriminator
 """
 
 import torch

@@ -10,7 +10,7 @@
 作用: 保证 Transformer 输出特征中保留足够的情绪判别信息，
       避免模型只做域对齐而丢失情绪分类能力。
 
-结构 (参考导师代码 classifier):
+结构:
     z (d_model) → Linear → ReLU → Dropout → Linear → 2 classes
 """
 

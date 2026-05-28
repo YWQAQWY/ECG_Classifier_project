@@ -1,7 +1,6 @@
 # ============================================================
 # DANN + Transformer 跨被试 EEG 情绪识别 - 配置文件
 # 架构: 共享Transformer F + 三个并列分支 (C / GRL+D / Con)
-# 参考: DEEP_DANN_SEED.py (导师代码)
 # ============================================================
 
 # 数据配置
@@ -33,8 +32,8 @@ data:
   # 归一化: z-score (每个被试独立)
   normalization: "zscore"
 
-  # 留一法交叉验证 (0=真正留一法, 每个被试轮流做target)
-  n_folds: 0
+  # 交叉验证折数 (5=5折CV, 0=留一法LOSO)
+  n_folds: 5
 
 # Transformer 编码器配置
 transformer:
@@ -76,13 +75,13 @@ ensemble:
 # 训练配置
 training:
   optimizer: "adam"
-  learning_rate: 5e-4           # 参考导师代码
-  weight_decay: 1e-4
+  learning_rate: 0.0005
+  weight_decay: 0.0001
 
   epochs: 100
   batch_size: 256               # 增大batch提升对比学习效果
 
-  # 学习率调度 (参考导师: StepLR gamma=0.99)
+  # 学习率调度
   lr_scheduler: "step"
   lr_step_size: 10
   lr_gamma: 0.99
@@ -92,7 +91,7 @@ training:
 # 损失权重
 loss_weights:
   cls: 1.0                      # 分类损失权重
-  domain: 0.1                   # 域对抗损失权重 (参考导师代码)
+  domain: 0.1                   # 域对抗损失权重
   contrastive: 0.05             # 对比学习损失权重
 
 # 实验配置

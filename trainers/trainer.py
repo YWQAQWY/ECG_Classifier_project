@@ -1,8 +1,8 @@
 """
-DANN + Transformer 训练器 (v2)
-==============================
+DANN + Transformer 训练器
+=========================
 
-训练流程 (参考 DEEP_DANN_SEED.py):
+训练流程:
 
 每 batch:
   Source B → Transformer F → z_s
@@ -15,26 +15,21 @@ DANN + Transformer 训练器 (v2)
 
   L_total = λ1*L_cls + λ2*L_domain + λ3*L_con
 
-集成伪标签 (周期性):
-  训练基础分类器 → 目标域投票 → 全票通过 → 加入源域
+注意: 集成伪标签已在数据预处理阶段完成 (data/dataset.py)
 """
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
 import os
-from torch.utils.data import DataLoader, TensorDataset
-from typing import Optional
+from torch.utils.data import DataLoader
 
 from models.transformer_encoder import TransformerEncoder
 from models.classifier import EmotionClassifier
 from models.domain_discriminator import DomainDiscriminator
 from models.contrastive_head import ContrastiveHead
 from losses.dann_loss import DANNTotalLoss
-from ensemble.pseudo_labeler import EnsemblePseudoLabeler
 from utils.logger import Logger
-from utils.visualization import plot_training_curves
 
 
 class DANNTrainer:
@@ -72,17 +67,17 @@ class DANNTrainer:
         self.domain_disc.to(self.device)
         self.contrastive_head.to(self.device)
 
-        # 优化器 (参考导师: Adam, lr=5e-4, wd=1e-4)
+        # 优化器
         train_cfg = config.get('training', {})
         self.optimizer = optim.Adam(
             list(self.encoder.parameters()) +
             list(self.classifier.parameters()) +
             list(self.domain_disc.parameters()),
-            lr=train_cfg.get('learning_rate', 5e-4),
-            weight_decay=train_cfg.get('weight_decay', 1e-4),
+            lr=train_cfg.get('learning_rate', 0.0005),
+            weight_decay=train_cfg.get('weight_decay', 0.0001),
         )
 
-        # 学习率调度 (参考导师: StepLR, step=10, gamma=0.99)
+        # 学习率调度
         self.scheduler = optim.lr_scheduler.StepLR(
             self.optimizer,
             step_size=train_cfg.get('lr_step_size', 10),
@@ -98,24 +93,13 @@ class DANNTrainer:
             temperature=config.get('contrastive', {}).get('temperature', 0.1),
         )
 
-        # 集成伪标签器
-        self.ensemble = None
-        ensemble_cfg = config.get('ensemble', {})
-        if ensemble_cfg.get('enabled', True):
-            self.ensemble = EnsemblePseudoLabeler(
-                confidence_threshold=ensemble_cfg.get('confidence_threshold', 0.8),
-            )
-            self.ensemble_update_interval = ensemble_cfg.get('update_interval', 10)
-            self.ensemble_max_ratio = ensemble_cfg.get('add_to_source_percent', 0.3)
-
         # 训练参数
         self.epochs = train_cfg.get('epochs', 100)
-        self.log_interval = config.get('experiment', {}).get('log_interval', 10)
         self.eval_interval = config.get('experiment', {}).get('eval_interval', 1)
         self.save_dir = config.get('experiment', {}).get('save_dir', './checkpoints')
         os.makedirs(self.save_dir, exist_ok=True)
 
-        # 历史
+        # 训练历史
         self.history = {'epoch': [], 'loss_cls': [], 'loss_domain': [],
                         'loss_con': [], 'val_acc': []}
 
@@ -148,9 +132,9 @@ class DANNTrainer:
 
         tgt_iter = iter(tgt_loader)
 
-        for batch_idx, src_batch in enumerate(src_loader):
+        for src_batch in src_loader:
             # ---- 获取数据 ----
-            x_s, y_s, _, _ = src_batch  # domain=0
+            x_s, y_s, _, _ = src_batch
             x_s, y_s = x_s.to(self.device), y_s.to(self.device)
 
             try:
@@ -159,24 +143,23 @@ class DANNTrainer:
                 tgt_iter = iter(tgt_loader)
                 x_t, y_t, _, _ = next(tgt_iter)
             x_t = x_t.to(self.device)
-            y_t = y_t.to(self.device)  # 不参与训练, 仅用于评估
 
             # ---- Forward: 共享 Transformer F ----
             z_s = self.encoder(x_s)  # (N_s, d_model)
             z_t = self.encoder(x_t)  # (N_t, d_model)
 
             # ---- 分支 C: 情绪分类 ----
-            cls_logits_s = self.classifier(z_s)  # (N_s, 2)
+            cls_logits_s = self.classifier(z_s)
 
             # ---- 分支 D: 域判别 (GRL + D) ----
-            dom_logits_s = self.domain_disc(z_s, grl_alpha=1.0)  # → 0 (source)
-            dom_logits_t = self.domain_disc(z_t, grl_alpha=1.0)  # → 1 (target)
+            dom_logits_s = self.domain_disc(z_s, grl_alpha=1.0)
+            dom_logits_t = self.domain_disc(z_t, grl_alpha=1.0)
 
             # ---- 分支 Con: 对比学习 ----
             z_s_norm = self.contrastive_head(z_s)
             z_t_norm = self.contrastive_head(z_t)
 
-            # 生成 target 伪标签 (用于对比学习)
+            # 生成 target 伪标签 (仅用于对比学习)
             with torch.no_grad():
                 tgt_probs = torch.softmax(self.classifier(z_t), dim=1)
                 y_t_pseudo = torch.argmax(tgt_probs, dim=1)
@@ -203,79 +186,11 @@ class DANNTrainer:
         self.scheduler.step()
 
         return {
-            'loss_cls': ep_cls / n_batches,
-            'loss_domain': ep_dom / n_batches,
-            'loss_con': ep_con / n_batches,
-            'loss_total': ep_total / n_batches,
+            'loss_cls': ep_cls / max(n_batches, 1),
+            'loss_domain': ep_dom / max(n_batches, 1),
+            'loss_con': ep_con / max(n_batches, 1),
+            'loss_total': ep_total / max(n_batches, 1),
         }
-
-    def run_ensemble_update(self, src_loader: DataLoader,
-                            tgt_loader: DataLoader) -> Optional[DataLoader]:
-        """
-        执行集成伪标签更新: 训练基础分类器 → 投票 → 全票通过的加入源域。
-        """
-        if self.ensemble is None:
-            return src_loader
-
-        # 提取展平特征
-        self.encoder.eval()
-        X_src_list, y_src_list = [], []
-        for x, y, _, _ in src_loader:
-            X_src_list.append(x.view(x.size(0), -1).cpu().numpy())
-            y_src_list.append(y.cpu().numpy())
-        X_src = np.concatenate(X_src_list)
-        y_src = np.concatenate(y_src_list)
-
-        X_tgt_list = []
-        z_tgt_list = []
-        for x, _, _, _ in tgt_loader:
-            X_tgt_list.append(x.view(x.size(0), -1).cpu().numpy())
-            z = self.encoder(x.to(self.device))
-            z_tgt_list.append(z.detach().cpu().numpy())
-        X_tgt = np.concatenate(X_tgt_list)
-        z_tgt = np.concatenate(z_tgt_list[:len(X_tgt_list)])  # align
-
-        # 提取 source z
-        z_src_list = []
-        for x, _, _, _ in src_loader:
-            z = self.encoder(x.to(self.device))
-            z_src_list.append(z.detach().cpu().numpy())
-        z_src = np.concatenate(z_src_list)
-
-        # 训练集成模型 & 过滤伪标签
-        self.ensemble.fit(X_src, y_src)
-        good_idx, good_labels = self.ensemble.predict_and_filter(X_tgt)
-
-        if len(good_idx) == 0:
-            self.encoder.train()
-            return src_loader
-
-        # 限制数量
-        max_add = int(len(X_src) * self.ensemble_max_ratio)
-        if len(good_idx) > max_add:
-            keep = np.random.choice(len(good_idx), max_add, replace=False)
-            good_idx = np.array(good_idx)[keep]
-            good_labels = np.array(good_labels)[keep]
-
-        self.logger.info(f"  [Ensemble] 加入 {len(good_idx)} 个伪标签到源域")
-
-        # 合并到源域
-        # 展平特征 + z 都扩展
-        augmented_X = np.concatenate([X_src, X_tgt[good_idx]])
-        augmented_y = np.concatenate([y_src, good_labels])
-
-        # 重建 DataLoader
-        from torch.utils.data import TensorDataset
-        aug_dataset = TensorDataset(
-            torch.FloatTensor(augmented_X).view(-1, 30, 4),
-            torch.LongTensor(augmented_y),
-        )
-        aug_loader = DataLoader(aug_dataset,
-                                batch_size=src_loader.batch_size,
-                                shuffle=True, drop_last=True)
-
-        self.encoder.train()
-        return aug_loader
 
     def train_fold(self, src_loader: DataLoader, tgt_loader: DataLoader,
                    target_subject_id: str, fold_idx: int = 0) -> dict:
@@ -292,13 +207,6 @@ class DANNTrainer:
         for epoch in range(self.epochs):
             # 训练
             stats = self.train_epoch(src_loader, tgt_loader, epoch)
-
-            # 周期性集成伪标签更新
-            if (self.ensemble is not None and
-                (epoch + 1) % self.ensemble_update_interval == 0 and epoch > 0):
-                new_src_loader = self.run_ensemble_update(src_loader, tgt_loader)
-                if new_src_loader is not None:
-                    src_loader = new_src_loader
 
             # 验证
             if (epoch + 1) % self.eval_interval == 0:
@@ -321,7 +229,6 @@ class DANNTrainer:
 
                 if val_acc > best_acc:
                     best_acc = val_acc
-                    best_epoch = epoch + 1
                     best_state = {
                         'encoder': self.encoder.state_dict(),
                         'classifier': self.classifier.state_dict(),

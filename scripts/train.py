@@ -68,9 +68,16 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default='configs/config.yaml')
     parser.add_argument('--debug', action='store_true')
+    parser.add_argument('--loso', action='store_true', help='使用留一法 (60折, 替代5折CV)')
+    parser.add_argument('--folds', type=int, default=None, help='自定义折数 (0=LOSO)')
     args = parser.parse_args()
 
     config = load_config(args.config)
+
+    if args.loso:
+        config['data']['n_folds'] = 0
+    elif args.folds is not None:
+        config['data']['n_folds'] = args.folds
 
     if args.debug:
         config['training']['epochs'] = 20
@@ -91,14 +98,18 @@ def main():
     data_cfg = config.get('data', {})
     train_cfg = config.get('training', {})
 
+    ensemble_cfg = config.get('ensemble', {})
     data_loader = CrossSubjectDataLoader(
         train_root=data_cfg.get('train_root', './赛题四数据集及说明文档/训练集'),
         window_size=data_cfg.get('window_size', 250),
         stride=data_cfg.get('stride', 125),
         fs=data_cfg.get('sampling_rate', 250),
         batch_size=train_cfg.get('batch_size', 128),
-        n_folds=train_cfg.get('n_folds', 5),
+        n_folds=data_cfg.get('n_folds', 5),
         downsample_ratio=data_cfg.get('downsample_ratio', 0.5),
+        ensemble_enabled=ensemble_cfg.get('enabled', True),
+        ensemble_threshold=ensemble_cfg.get('confidence_threshold', 0.8),
+        ensemble_max_ratio=ensemble_cfg.get('add_to_source_percent', 0.3),
     )
 
     # 留一法交叉验证

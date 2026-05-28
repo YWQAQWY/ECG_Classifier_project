@@ -2,11 +2,10 @@
 
 ## 方法概述
 
-基于 **Domain Adversarial Neural Network (DANN)** + **Transformer** 的跨被试 EEG 情绪识别。
+基于 **Domain Adversarial Neural Network (DANN)** + **Transformer** + **对比学习** 的跨被试 EEG 情绪识别。
 
 **核心思想**: 用域对抗训练 (GRL + Domain Discriminator) 消除不同被试间的 domain shift，同时用对比学习保持 latent space 的类别结构。
 
-参考: 导师代码 `DEEP_DANN_SEED.py`，将其 DANN 思路适配到竞赛 EEG 数据集。
 
 ## 项目结构
 
@@ -17,12 +16,14 @@ ECG/
 │
 ├── data/
 │   ├── preprocess.py                      # EEG 预处理管线
-│   │   ├── Trial 切分 + 降采样 + 滑动窗口
+│   │   ├── Trial 切分 + 滑动窗口
+│   │   ├── 降采样 (每被试随机保留)
 │   │   ├── 每被试独立 Z-score 归一化 (防泄漏)
 │   │   └── DE 特征提取 (θ/α/β/γ 4频段)
-│   └── dataset.py                         # PyTorch Dataset + LOSO 划分
+│   └── dataset.py                         # PyTorch Dataset + 预处理集成
 │       ├── EEGDataset                     # 含 domain label (0=source, 1=target)
-│       ├── CrossSubjectDataLoader.folds() # 留一法 / K折交叉验证
+│       ├── CrossSubjectDataLoader         # LOSO / K折划分
+│       │   └── folds() 中完成集成伪标签   # 预处理阶段: SVM+RF+MLP+LR 全票通过
 │       └── TestDataLoader                 # 测试集加载
 │
 ├── models/
@@ -31,23 +32,47 @@ ECG/
 │   ├── classifier.py                      # 分支 C: 情绪分类器 (CE loss)
 │   ├── domain_discriminator.py            # 分支 D: GRL + 域判别器 (对抗)
 │   │   └── GradReverse (前向恒等, 反向梯度×(-λ))
-│   └── contrastive_head.py                # 分支 Con: 对比学习头 (L2 norm)
+│   └── contrastive_head.py                # 分支 Con: 对比学习头 (L2 norm, 无参数)
 │
 ├── losses/
 │   ├── contrastive_loss.py                # InfoNCE 对比损失 (内积相似度)
 │   └── dann_loss.py                       # 组合损失: CE + λd·Domain + λc·Contrastive
 │
 ├── ensemble/
-│   └── pseudo_labeler.py                  # 集成伪标签 (SVM+RF+MLP+LR 全票通过)
+│   └── pseudo_labeler.py                  # 集成伪标签器 (SVM×2 + RF + LR + MLP)
 │
 ├── trainers/
-│   └── trainer.py                         # DANN 训练循环 + 周期集成更新
+│   └── trainer.py                         # DANN 训练循环 (纯训练, 无预处理逻辑)
 │
 ├── scripts/
-│   ├── train.py                           # LOSO 训练入口
-│   └── test.py                            # 测试集推理
+│   ├── train.py                           # 训练入口 (5折CV / LOSO)
+│   └── test.py                            # 测试集 LOSO 域适应 + 推理
 │
 └── utils/                                 # seed / logger / metrics / visualization
+```
+
+## 预处理管线 (按顺序执行)
+
+```
+文件: data/preprocess.py  data/dataset.py  ensemble/pseudo_labeler.py
+─────────────────────────────────────────────────────────────────────
+
+对每个被试独立执行:
+
+  Step 1. 降采样
+    → 每个被试随机保留 downsample_ratio 比例的窗口 (减少冗余)
+    → config: data.downsample_ratio = 0.5
+
+  Step 2. 每被试独立 Z-score 归一化
+    → normalize_per_subject(): 每个被试各自算 mean/std (防数据泄漏)
+    → x_norm = (x - μ_subject) / σ_subject
+
+对每折 (fold) 执行:
+
+  Step 3. 集成伪标签 (预处理阶段, 非训练阶段!)
+    → 5 个基础分类器 (SVM×2 + RF + LR + MLP) 在源域训练
+    → 对目标域投票 → 全票通过 → 加入源域
+    → config: ensemble.enabled, ensemble.confidence_threshold = 0.8
 ```
 
 ## 网络架构
@@ -73,23 +98,9 @@ ECG/
 ```
 
 **三个并列分支共同约束 Transformer:**
-- **C**: emotion-discriminative (情绪可判别)
-- **D**: domain-invariant (域不变，对抗训练)
-- **Con**: contrastively-structured (类结构约束，同类聚/异类分)
-
-## 数据管线
-
-```
-文件: data/preprocess.py
-────────────────────────
-
-.mat 文件 → Trial 切分 (train:12500/test:2500)
-  → 降采样 (downsample_ratio=0.5, 每被试随机保留)
-  → 滑动窗口 (window=250, stride=125)
-  → DE 特征 (bandpass + DE=0.5·log(2πeσ²))
-  → 每被试独立 Z-score 归一化 (防数据泄漏)
-  → 输出 (n_windows, 30 channels, 4 bands)
-```
+- **C**: emotion-discriminative (情绪可判别, 仅 source 真实标签)
+- **D**: domain-invariant (域不变, GRL 梯度反转对抗训练)
+- **Con**: contrastively-structured (类结构约束, 同类内积大/异类内积小)
 
 ## 训练流程
 
@@ -100,93 +111,114 @@ ECG/
 每 batch:
   Source B ──► Transformer F ──► z_s
                                      ├──► C ──► L_cls (CE, source only)
-                                     ├──► GRL+D ──► L_domain (source vs target)
+                                     ├──► GRL+D ──► L_domain (source=0 vs target=1)
                                      └──► Con ──► L_con (同类近/异类远)
 
-  Target B ──► Transformer F ──► z_t  (共享F, 同上三个分支)
+  Target B ──► Transformer F ──► z_t  (共享 F, 同上三个分支)
 
   L_total = λ_cls*L_cls + λ_domain*L_domain + λ_con*L_con
-  (λ_cls=1.0, λ_domain=0.1, λ_con=0.05)
-
-周期集成伪标签:
-  每 10 epoch → SVM+RF+MLP+LR 训练 → 目标域投票
-  → 全票通过 → 加入源域训练集
+           = 1.0 * CE  + 0.1 * Domain  + 0.05 * Contrastive
 ```
 
-## 评估方法: 留一法 (LOSO)
+## 评估方法
 
-### 哪些模块使用 LOSO?
+### 训练阶段: 5 折 CV 或 LOSO
 
-| 文件 | 函数/类 | 作用 |
-|------|---------|------|
-| `data/dataset.py:94` | `CrossSubjectDataLoader.folds()` | 生成 LOSO 划分 |
-| `scripts/train.py:98` | `main()` 训练循环 | 遍历每折, 训练+评估 |
-| `configs/config.yaml` | `data.n_folds: 0` | 0 = 真正留一法 |
-
-### LOSO 流程
+| 命令 | 行为 | 折数 |
+|------|------|------|
+| `--folds 5` (默认) | 5 折交叉验证 | 5 |
+| `--loso` | 留一法 (每个被试轮流做 target) | 60 |
+| `--folds N` | 自定义 N 折 | N |
 
 ```
-n_folds=0 → 真正留一法:
-
-  Subject 1 做 Target, Subject 2~60 做 Source → 训练 → 评估 Acc₁
-  Subject 2 做 Target, Subject 1,3~60 做 Source → 训练 → 评估 Acc₂
+LOSO 原理:
+  Round 1: 训练 subj 2~60 → 测试 subj 1 → Acc₁
+  Round 2: 训练 subj 1,3~60 → 测试 subj 2 → Acc₂
   ...
-  Subject 60 做 Target, Subject 1~59 做 Source → 训练 → 评估 Acc₆₀
+  Round 60: 训练 subj 1~59 → 测试 subj 60 → Acc₆₀
+  最终: Mean Acc ± Std
 
-最终: Mean ± Std (60个被试的目标域准确率)
+5 折 CV:
+  60 人分 5 组, 每组取第 1 个做 target, 跑 5 轮
 ```
 
-### K-Fold 模式
+### 测试阶段: LOSO 域适应 + 推理
 
 ```
-n_folds=5 → 5折交叉验证 (快速调试用):
+文件: scripts/test.py
+─────────────────────
 
-  60个被试随机分为5组, 每组取第1个做 Target
-  跑5折, 每折1个 target subject
+对每个测试被试 (10 人), 单独做一次 DANN 域适应:
+  Source = 训练集 60 人 (有标签)
+  Target = 1 个测试被试 (无标签, 用于 GRL+D 域对抗)
+  → 训练 ~33 epoch → 推理 8 个 trial → 多数投票
+
+输出: predictions.csv → 提交竞赛平台
 ```
+
+注意: 测试集无标签, **无法本地评估准确度**, 只能提交看分数。
 
 ## 使用方法
 
 ```bash
-cd /home/yanwq/ECG
-source venv/bin/activate
+cd /home/yanwq/ECG && source venv/bin/activate
 
-# 调试模式 (3折, 20 epoch, ~5分钟)
-python -m scripts.train --config configs/config.yaml --debug
-
-# 完整 LOSO (60折, 100 epoch, 耗时长)
+# 5折交叉验证 (默认)
 python -m scripts.train --config configs/config.yaml
 
-# 测试集推理
-python -m scripts.test --checkpoint checkpoints/best_dann_fold0.pth --output predictions.csv
+# 留一法 LOSO (60折)
+python -m scripts.train --config configs/config.yaml --loso
+
+# 自定义折数
+python -m scripts.train --config configs/config.yaml --folds 10
+
+# 调试模式 (3折, 20 epoch)
+python -m scripts.train --config configs/config.yaml --debug
+
+# 测试集推理 (LOSO 域适应)
+python -m scripts.test --config configs/config.yaml --output predictions.csv
 ```
 
 ## 关键超参数
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `data.downsample_ratio` | 0.5 | 降采样比例 |
-| `data.n_folds` | 0 | 0=LOSO, N=K折 |
+| `data.downsample_ratio` | 0.5 | 降采样比例 (每被试) |
+| `data.n_folds` | 5 | 折数 (5=5折CV, 0=LOSO) |
+| `data.normalization` | zscore | 每被试独立归一化 |
 | `transformer.d_model` | 64 | Transformer 隐层维度 |
 | `transformer.n_layers` | 3 | Transformer 层数 |
 | `transformer.n_heads` | 4 | 注意力头数 |
+| `transformer.dropout` | 0.1 | Transformer dropout |
+| `classifier.dropout` | 0.3 | 分类器 dropout |
+| `ensemble.enabled` | true | 预处理中启用集成伪标签 |
+| `ensemble.confidence_threshold` | 0.8 | 全票通过阈值 |
 | `loss_weights.cls` | 1.0 | CE 分类损失权重 |
 | `loss_weights.domain` | 0.1 | 域对抗损失权重 |
 | `loss_weights.contrastive` | 0.05 | 对比学习损失权重 |
 | `contrastive.temperature` | 0.1 | 对比学习温度 |
-| `ensemble.enabled` | true | 是否启用集成伪标签 |
-| `training.learning_rate` | 5e-4 | 学习率 |
+| `training.learning_rate` | 0.0005 | 学习率 |
 | `training.batch_size` | 128 | 批大小 |
 
-## 与导师代码的对应关系
 
-| 导师代码 DEEP_DANN_SEED.py | 本项目 |
-|---|---|
-| `GradReverse` | `models/domain_discriminator.py:GradReverse` |
-| `SingleModalityFeatureExtractor` (MLP) | `models/transformer_encoder.py:TransformerEncoder` |
-| `classifier` (128→64→2) | `models/classifier.py:EmotionClassifier` (64→32→2) |
-| `domain_discriminator` (128→64→N) | `models/domain_discriminator.py:DomainDiscriminator` (64→32→2) |
-| `total_loss = cls + 0.1*domain + constraint` | `losses/dann_loss.py` (CE + 0.1*Domain + 0.05*Con) |
-| `ModalityMaskEnhancement` | 未采用 (用降采样+对比学习替代) |
-| SEED 多模态 (EEG+EYE) | 竞赛 EEG 单模态 |
-| Leave-One-Subject-Out (for loop) | `CrossSubjectDataLoader.folds()` LOSO |
+## 数据流总结
+
+```
+原始 .mat (60+10 subjects)
+  │
+  ▼
+preprocess.py:
+  Trial切分 → 滑动窗口 → DE特征 (30ch×4bands)
+  │
+  ▼
+dataset.py (每被试独立):
+  降采样 → Z-score归一化 → 集成伪标签(预处理)
+  │
+  ▼
+trainer.py (5折CV / LOSO):
+  Transformer F → C + GRL+D + Con → 训练
+  │
+  ▼
+test.py (测试集LOSO域适应):
+  每测试被试: 源域60人 + 目标域该被试 → DANN适应 → 推理
+```

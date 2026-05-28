@@ -11,7 +11,7 @@ DANN 总损失模块
     L_domain (分支D): CrossEntropy on domain classification (source vs target)
     L_con    (分支Con): 对比学习损失 (类结构约束)
 
-参考导师代码: total_loss = loss_cls + 0.1 * loss_domain + constraint_loss
+L_total = λ_cls*L_cls + λ_domain*L_domain + λ_con*L_con
 """
 
 import torch
