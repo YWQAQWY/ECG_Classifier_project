@@ -22,6 +22,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import os
+
+import numpy as np
 from torch.utils.data import DataLoader
 
 from models.transformer_encoder import TransformerEncoder
@@ -49,13 +51,20 @@ class DANNTrainer:
 
     def __init__(self, encoder: TransformerEncoder, classifier: EmotionClassifier,
                  domain_disc: DomainDiscriminator, contrastive_head: ContrastiveHead,
-                 config: dict, logger: Logger):
+                 config: dict, logger: Logger,
+                 stage_config: dict = None):
+        """
+        参数:
+            stage_config: 可选的 stage 特定配置, 覆盖 config 中的默认值
+                {'domain_weight': 0.3, 'class_weight': [1.0, 2.0]}
+        """
         self.encoder = encoder
         self.classifier = classifier
         self.domain_disc = domain_disc
         self.contrastive_head = contrastive_head
         self.config = config
         self.logger = logger
+        self.stage_config = stage_config or {}
 
         # 设备
         device_str = config.get('training', {}).get('device', 'cuda')
@@ -84,18 +93,22 @@ class DANNTrainer:
             gamma=train_cfg.get('lr_gamma', 0.99),
         )
 
-        # DANN 损失
+        # DANN 损失 (支持 stage 级覆盖)
         lw = config.get('loss_weights', {})
+        domain_w = self.stage_config.get('domain_weight', lw.get('domain', 0.1))
+        class_w = self.stage_config.get('class_weight', None)
         self.criterion = DANNTotalLoss(
             cls_weight=lw.get('cls', 1.0),
-            domain_weight=lw.get('domain', 0.1),
+            domain_weight=domain_w,
             contrastive_weight=lw.get('contrastive', 0.05),
             temperature=config.get('contrastive', {}).get('temperature', 0.1),
+            class_weight=class_w,
         )
 
         # 训练参数
-        self.epochs = train_cfg.get('epochs', 100)
+        self.epochs = self.stage_config.get('epochs', train_cfg.get('epochs', 100))
         self.eval_interval = config.get('experiment', {}).get('eval_interval', 1)
+        self.is_stage1 = self.stage_config.get('is_stage1', False)
         self.save_dir = config.get('experiment', {}).get('save_dir', './checkpoints')
         os.makedirs(self.save_dir, exist_ok=True)
 
@@ -105,20 +118,41 @@ class DANNTrainer:
 
     @torch.no_grad()
     def _evaluate_target_acc(self, tgt_loader: DataLoader) -> float:
-        """评估目标域准确率"""
+        """评估目标域准确率。Stage1 时使用被试级多数投票。"""
         self.encoder.eval()
         self.classifier.eval()
-        correct, total = 0, 0
-        for x, y, _, _ in tgt_loader:
-            x, y = x.to(self.device), y.to(self.device)
-            z = self.encoder(x)
-            logits = self.classifier(z)
-            preds = torch.argmax(logits, dim=1)
-            correct += (preds == y).sum().item()
-            total += y.size(0)
-        self.encoder.train()
-        self.classifier.train()
-        return correct / total if total > 0 else 0.0
+
+        if self.is_stage1:
+            # Stage 1: 被试级评估 — 所有窗口投票 → 被试级预测
+            all_preds, all_labels = [], []
+            for x, y, _, _ in tgt_loader:
+                x = x.to(self.device)
+                z = self.encoder(x)
+                logits = self.classifier(z)
+                preds = torch.argmax(logits, dim=1)
+                all_preds.append(preds.cpu().numpy())
+                all_labels.append(y.numpy())
+            all_preds = np.concatenate(all_preds)
+            all_labels = np.concatenate(all_labels)
+            # 所有窗口投票 → 被试级: 取多数标签
+            subject_pred = int(np.argmax(np.bincount(all_preds, minlength=2)))
+            subject_label = int(all_labels[0])  # 同一被试所有窗口标签相同
+            self.encoder.train()
+            self.classifier.train()
+            return 1.0 if subject_pred == subject_label else 0.0
+        else:
+            # Stage 2: 窗口级评估
+            correct, total = 0, 0
+            for x, y, _, _ in tgt_loader:
+                x, y = x.to(self.device), y.to(self.device)
+                z = self.encoder(x)
+                logits = self.classifier(z)
+                preds = torch.argmax(logits, dim=1)
+                correct += (preds == y).sum().item()
+                total += y.size(0)
+            self.encoder.train()
+            self.classifier.train()
+            return correct / total if total > 0 else 0.0
 
     def train_epoch(self, src_loader: DataLoader, tgt_loader: DataLoader,
                     epoch: int) -> dict:

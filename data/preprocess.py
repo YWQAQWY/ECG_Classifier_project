@@ -133,18 +133,36 @@ def normalize_per_subject(features: np.ndarray) -> np.ndarray:
 def process_subject_train(filepath: str, trial_length: int = 12500,
                           window_size: int = 250, stride: int = 125,
                           fs: float = 250.0, downsample_ratio: float = 0.5,
-                          seed: int = 42) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+                          seed: int = 42,
+                          match_test_duration: bool = True,
+                          test_duration: int = 2500) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     """
     处理单个训练被试的 .mat 文件。
 
     完整管线:
-        .mat → trial切分 → 降采样 → 滑动窗口 → DE特征 → 归一化
+        .mat → trial切分 → [可选: 切分为测试集长度的短段] → 降采样 → 滑动窗口 → DE特征 → 归一化
+
+    关键参数 match_test_duration:
+        训练集每个 trial 是 50 秒 (12500 采样点), 测试集只有 10 秒 (2500 采样点)。
+        模型在 50 秒长段上训练的 DE 特征分布与 10 秒短段完全不同，
+        导致测试时坍塌到多数类。
+
+        match_test_duration=True 时:
+          将每个 50 秒 trial 切分为 5 个 10 秒短段,
+          每个短段独立做 DE 特征提取和归一化,
+          让训练条件完全匹配测试条件。
 
     返回:
         features: (n_windows, 30, 4)
         labels:   (n_windows,)  0=neutral, 1=positive
     """
     data = _load_mat_file(filepath)
+
+    # 训练集原始 trial 长度 (50秒=12500点) → 切分为测试集长度的短段 (10秒=2500点)
+    if match_test_duration:
+        segment_length = test_duration
+    else:
+        segment_length = trial_length
 
     all_features, all_labels = [], []
 
@@ -155,12 +173,19 @@ def process_subject_train(filepath: str, trial_length: int = 12500,
 
         trials = split_into_trials(eeg, trial_length)
         for trial in trials:
-            windows = apply_sliding_window(trial, window_size, stride)
-            if windows.shape[0] == 0:
-                continue
-            de_feats = np.array([extract_de_features(w, fs) for w in windows])
-            all_features.append(de_feats)
-            all_labels.append(np.full(de_feats.shape[0], label))
+            # 每个长 trial → 切分为短段 (匹配测试条件)
+            n_segments = trial.shape[1] // segment_length
+            for seg_idx in range(n_segments):
+                start = seg_idx * segment_length
+                end = start + segment_length
+                segment = trial[:, start:end]  # (30, segment_length)
+
+                windows = apply_sliding_window(segment, window_size, stride)
+                if windows.shape[0] == 0:
+                    continue
+                de_feats = np.array([extract_de_features(w, fs) for w in windows])
+                all_features.append(de_feats)
+                all_labels.append(np.full(de_feats.shape[0], label))
 
     if not all_features:
         return None, None

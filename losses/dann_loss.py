@@ -16,6 +16,7 @@ L_total = λ_cls*L_cls + λ_domain*L_domain + λ_con*L_con
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from .contrastive_loss import ContrastiveLoss
 
 
@@ -35,14 +36,28 @@ class DANNTotalLoss(nn.Module):
     """
 
     def __init__(self, cls_weight: float = 1.0, domain_weight: float = 0.1,
-                 contrastive_weight: float = 0.05, temperature: float = 0.1):
+                 contrastive_weight: float = 0.05, temperature: float = 0.1,
+                 class_weight: list = None):
         super().__init__()
         self.cls_weight = cls_weight
         self.domain_weight = domain_weight
         self.contrastive_weight = contrastive_weight
 
-        self.ce_loss = nn.CrossEntropyLoss()
+        # class_weight: 缓解类别不平衡, e.g. [1.0, 2.0] 给 depressed 更高权重
+        # register_buffer 确保 tensor 跟随 model 自动到正确的 device
+        if class_weight is not None:
+            self.register_buffer('_ce_weight', torch.tensor(class_weight, dtype=torch.float32))
+        else:
+            self._ce_weight = None
+
+        self.ce_loss = None  # 每次 forward 动态创建, 确保 device 一致
         self.con_loss = ContrastiveLoss(temperature=temperature)
+
+    def _get_ce_loss(self, device):
+        """返回 CrossEntropyLoss，确保 weight tensor 在正确的 device 上"""
+        if self._ce_weight is not None:
+            return nn.CrossEntropyLoss(weight=self._ce_weight.to(device))
+        return nn.CrossEntropyLoss()
 
     def forward(self, cls_logits_s: torch.Tensor, y_s: torch.Tensor,
                 domain_logits_s: torch.Tensor, domain_logits_t: torch.Tensor,
@@ -64,7 +79,8 @@ class DANNTotalLoss(nn.Module):
             {'total': ..., 'cls': ..., 'domain': ..., 'contrastive': ...}
         """
         # ---- L_cls: 情绪分类 (仅 source 真实标签) ----
-        loss_cls = self.ce_loss(cls_logits_s, y_s)
+        ce_loss = self._get_ce_loss(cls_logits_s.device)
+        loss_cls = ce_loss(cls_logits_s, y_s)
 
         # ---- L_domain: 域对抗 ----
         # Source domain label = 0, Target domain label = 1
@@ -73,8 +89,9 @@ class DANNTotalLoss(nn.Module):
         domain_labels_t = torch.ones(domain_logits_t.size(0), dtype=torch.long,
                                       device=domain_logits_t.device)
 
-        loss_domain_s = self.ce_loss(domain_logits_s, domain_labels_s)
-        loss_domain_t = self.ce_loss(domain_logits_t, domain_labels_t)
+        # Domain loss 不需要 class weight
+        loss_domain_s = F.cross_entropy(domain_logits_s, domain_labels_s)
+        loss_domain_t = F.cross_entropy(domain_logits_t, domain_labels_t)
         loss_domain = (loss_domain_s + loss_domain_t) / 2.0
 
         # ---- L_con: 对比学习 ----

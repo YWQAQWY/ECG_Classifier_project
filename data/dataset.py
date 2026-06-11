@@ -140,9 +140,14 @@ class TestDataLoader:
 def load_all_train_subjects(train_root: str, window_size: int = 250,
                             stride: int = 125, fs: float = 250.0,
                             downsample_enabled: bool = True,
-                            downsample_ratio: float = 0.5) -> tuple:
+                            downsample_ratio: float = 0.5,
+                            match_test_duration: bool = True,
+                            test_segment_length: int = 2500) -> tuple:
     """
     加载全部训练被试, 每人独立降采样 + zscore 归一化。
+
+    参数:
+        match_test_duration: 将50s训练trial切为10s短段, 匹配测试集条件
 
     返回:
         all_subjects: {subject_id: (features, emotion_labels)}
@@ -167,6 +172,8 @@ def load_all_train_subjects(train_root: str, window_size: int = 250,
         features, labels = process_subject_train(
             fp, trial_length=12500, window_size=window_size,
             stride=stride, fs=fs, downsample_ratio=ratio,
+            match_test_duration=match_test_duration,
+            test_duration=test_segment_length,
         )
         if features is not None and len(features) > 0:
             all_subjects[sid] = (features, labels)

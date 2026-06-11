@@ -175,10 +175,16 @@ def train_stage1(all_subjects, depression_labels, test_loader, config, logger):
         logger.info(f"\nStage1 Fold {fold_idx}: Target={target_id}")
 
         encoder, classifier, domain_disc, contrastive_head = build_models(config, n_classes=2)
+        s1_cfg = config.get('stage1', {})
         trainer = DANNTrainer(encoder, classifier, domain_disc, contrastive_head,
-                              config, logger)
-        trainer.epochs = config.get('training', {}).get('stage1_epochs',
-                                                         train_cfg.get('epochs', 100) // 2)
+                              config, logger,
+                              stage_config={
+                                  'is_stage1': True,
+                                  'epochs': s1_cfg.get('epochs',
+                                                       train_cfg.get('stage1_epochs', 100)),
+                                  'domain_weight': s1_cfg.get('domain_weight', 0.3),
+                                  'class_weight': s1_cfg.get('class_weight', [1.0, 2.0]),
+                              })
         tgt_dep_label = depression_labels.get(target_id, -1)
         result = trainer.train_fold(src_loader, tgt_loader, target_id, fold_idx,
                                     depression_label=tgt_dep_label)
@@ -352,6 +358,8 @@ def main():
         fs=data_cfg.get('sampling_rate', 250),
         downsample_enabled=ds_cfg.get('enabled', True),
         downsample_ratio=ds_cfg.get('ratio', 0.5),
+        match_test_duration=data_cfg.get('match_test_duration', True),
+        test_segment_length=data_cfg.get('test_segment_length', 2500),
     )
 
     # ================================================================
