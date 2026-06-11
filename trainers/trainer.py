@@ -193,8 +193,13 @@ class DANNTrainer:
         }
 
     def train_fold(self, src_loader: DataLoader, tgt_loader: DataLoader,
-                   target_subject_id: str, fold_idx: int = 0) -> dict:
-        """训练一个 fold"""
+                   target_subject_id: str, fold_idx: int = 0,
+                   depression_label: int = -1) -> dict:
+        """训练一个 fold
+
+        参数:
+            depression_label: 验证被试的抑郁症标签 (0=healthy, 1=depressed, -1=unknown)
+        """
         best_acc = 0.0
         best_state = None
         self.history = {'epoch': [], 'loss_cls': [], 'loss_domain': [],
@@ -244,4 +249,8 @@ class DANNTrainer:
 
         self.logger.info(f"Fold {fold_idx} 完成 | Best Acc={best_acc:.4f}")
 
-        return {'target_subject': target_subject_id, 'best_accuracy': best_acc}
+        return {
+            'target_subject': target_subject_id,
+            'best_accuracy': best_acc,
+            'depression_label': depression_label,
+        }

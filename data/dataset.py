@@ -140,22 +140,26 @@ class TestDataLoader:
 def load_all_train_subjects(train_root: str, window_size: int = 250,
                             stride: int = 125, fs: float = 250.0,
                             downsample_enabled: bool = True,
-                            downsample_ratio: float = 0.5) -> dict:
+                            downsample_ratio: float = 0.5) -> tuple:
     """
     加载全部训练被试, 每人独立降采样 + zscore 归一化。
 
-    返回: {subject_id: (features, labels)}
+    返回:
+        all_subjects: {subject_id: (features, emotion_labels)}
+        depression_labels: {subject_id: 0=healthy, 1=depressed}
     """
     file_paths = []
     for subdir in ["正常人", "抑郁症患者"]:
         d = os.path.join(train_root, subdir)
         if os.path.exists(d):
-            file_paths.extend(sorted(glob.glob(os.path.join(d, "*.mat"))))
+            for fp in sorted(glob.glob(os.path.join(d, "*.mat"))):
+                file_paths.append((fp, subdir))
 
     print(f"[加载] 找到 {len(file_paths)} 个训练文件")
 
     all_subjects = {}
-    for i, fp in enumerate(file_paths):
+    depression_labels = {}
+    for i, (fp, subdir) in enumerate(file_paths):
         sid = os.path.basename(fp).replace("timedata.mat", "")
         print(f"\r[加载] [{i+1}/{len(file_paths)}] {sid}", end="", flush=True)
 
@@ -166,10 +170,14 @@ def load_all_train_subjects(train_root: str, window_size: int = 250,
         )
         if features is not None and len(features) > 0:
             all_subjects[sid] = (features, labels)
+            depression_labels[sid] = 0 if subdir == "正常人" else 1
 
+    n_healthy = sum(1 for v in depression_labels.values() if v == 0)
+    n_depressed = sum(1 for v in depression_labels.values() if v == 1)
     ds_status = f"降采样={downsample_ratio}" if downsample_enabled else "无降采样"
-    print(f"\r[加载] 完成 {len(all_subjects)} 个被试 ({ds_status}, 每人独立zscore)")
-    return all_subjects
+    print(f"\r[加载] 完成 {len(all_subjects)} 个被试 "
+          f"(健康={n_healthy}, 抑郁={n_depressed}, {ds_status}, 每人独立zscore)")
+    return all_subjects, depression_labels
 
 
 def expand_source_with_ensemble(all_subjects: dict, test_root: str,

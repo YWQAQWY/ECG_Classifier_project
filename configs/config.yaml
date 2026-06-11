@@ -79,6 +79,7 @@ training:
   weight_decay: 0.0001
 
   epochs: 100
+  stage1_epochs: 50            # Stage 1 (抑郁症分类) 训练轮数
   batch_size: 512             
 
   # 学习率调度
