@@ -41,7 +41,7 @@ def load_config(path):
 
 
 def _get_device(config):
-    """获取可用设备，CUDA 不可用时回退 CPU"""
+    """获取可用设备, CUDA 不可用时回退 CPU"""
     if not torch.cuda.is_available():
         return torch.device('cpu')
     try:
@@ -49,13 +49,13 @@ def _get_device(config):
         del t
         return torch.device('cuda')
     except Exception:
-        print('[WARN] CUDA driver 版本不兼容，回退到 CPU')
+        print('[WARN] CUDA driver 版本不兼容, 回退到 CPU')
         config['training']['device'] = 'cpu'
         return torch.device('cpu')
 
 
 def build_models(config, n_classes):
-    """构建 Transformer F + C + D + Con。n_classes 区分 Stage1(2) vs Stage2(2)"""
+    """构建 Transformer F + C + D + Con"""
     tf_cfg = config.get('transformer', {})
     encoder = TransformerEncoder(
         token_dim=tf_cfg.get('token_dim', 4), n_tokens=tf_cfg.get('n_tokens', 30),
@@ -79,12 +79,7 @@ def build_models(config, n_classes):
 
 
 def predict_test_subject_level(encoder, classifier, test_loader, device):
-    """
-    对测试集逐被试推理, 返回被试级预测。
-
-    每个被试: 所有窗口投票 → 被试级标签。
-    返回: {sid: subject_level_prediction}
-    """
+    """被试级预测: 所有窗口投票"""
     encoder.eval(); classifier.eval()
     results = {}
     for sid in test_loader.get_subject_ids():
@@ -95,19 +90,16 @@ def predict_test_subject_level(encoder, classifier, test_loader, device):
                 logits = classifier(encoder(x.to(device)))
                 window_preds.append(torch.argmax(logits, dim=1).cpu().numpy())
         all_preds = np.concatenate(window_preds)
-        # 被试级: 所有窗口多数投票
         results[sid] = int(np.argmax(np.bincount(all_preds, minlength=2)))
-
     encoder.train(); classifier.train()
     return results
 
 
 def predict_test_trial_level(encoder, classifier, test_loader, device):
-    """对测试集逐被试推理, 返回 trial 级预测 (8 trial/被试)"""
+    """trial 级预测: 窗口投票 → 每被试 8 trial"""
     encoder.eval(); classifier.eval()
     all_results = {}
     windows_per_trial = max(0, (2500 - 250) // 125 + 1)
-
     for sid in test_loader.get_subject_ids():
         loader = test_loader.get_loader(sid)
         window_preds = []
@@ -116,14 +108,12 @@ def predict_test_trial_level(encoder, classifier, test_loader, device):
                 logits = classifier(encoder(x.to(device)))
                 window_preds.append(torch.argmax(logits, dim=1).cpu().numpy())
         window_preds = np.concatenate(window_preds)
-
         trial_preds = []
         for t in range(8):
             s, e = t * windows_per_trial, (t + 1) * windows_per_trial
             tw = window_preds[s:min(e, len(window_preds))]
             trial_preds.append(int(np.argmax(np.bincount(tw, minlength=2))) if len(tw) > 0 else 0)
         all_results[sid] = trial_preds
-
     encoder.train(); classifier.train()
     return all_results
 
@@ -133,11 +123,12 @@ def predict_test_trial_level(encoder, classifier, test_loader, device):
 # ================================================================
 def train_stage1(all_subjects, depression_labels, test_loader, config, logger):
     """
-    Stage 1: 对训练集做 K折CV 训练抑郁症分类器, 每折对测试集推理。
+    Stage 1: 抑郁症分类 K折CV, 收集验证结果 (不在此打印报告)。
 
-    标签: 0=healthy, 1=depressed
-
-    返回: test_depression_preds — {sid: 0=healthy, 1=depressed}
+    返回:
+        final_depression: {sid: 0/1}
+        healthy_tests, depressed_tests: 测试被试分组
+        stage1_val_results: 验证结果列表 (用于最终报告)
     """
     logger.info(f"\n{'='*60}")
     logger.info("Stage 1: 抑郁症分类 (healthy vs depressed)")
@@ -147,16 +138,12 @@ def train_stage1(all_subjects, depression_labels, test_loader, config, logger):
     data_cfg = config.get('data', {})
     device = _get_device(config)
 
-    # 将 emotion_labels 替换为 depression_labels (跳过伪标签被试)
     stage1_subjects = {}
     for sid in sorted(all_subjects.keys()):
-        if sid.startswith('pseudo_'):
-            continue  # 伪标签被试没有 depression 标签
-        if sid not in depression_labels:
+        if sid.startswith('pseudo_') or sid not in depression_labels:
             continue
         features, _ = all_subjects[sid]
         dep_label = depression_labels[sid]
-        # 每个被试的所有窗口共享同一个 depression label
         stage1_subjects[sid] = (features, np.full(len(features), dep_label))
 
     cv_loader = CrossSubjectDataLoader(
@@ -166,7 +153,7 @@ def train_stage1(all_subjects, depression_labels, test_loader, config, logger):
     )
 
     all_depression_preds = []
-    stage1_val_results = []  # 收集验证结果用于报告
+    stage1_val_results = []
 
     for fold_idx, (src_loader, tgt_loader, target_id) in enumerate(cv_loader.folds()):
         if tgt_loader is None:
@@ -184,6 +171,7 @@ def train_stage1(all_subjects, depression_labels, test_loader, config, logger):
                                                        train_cfg.get('stage1_epochs', 100)),
                                   'domain_weight': s1_cfg.get('domain_weight', 0.3),
                                   'class_weight': s1_cfg.get('class_weight', [1.0, 2.0]),
+                                  'contrastive_weight': 0.0,  # Stage1 关闭对比学习
                               })
         tgt_dep_label = depression_labels.get(target_id, -1)
         result = trainer.train_fold(src_loader, tgt_loader, target_id, fold_idx,
@@ -191,11 +179,10 @@ def train_stage1(all_subjects, depression_labels, test_loader, config, logger):
         logger.info(f"Stage1 Fold {fold_idx}: Val Acc={result['best_accuracy']:.4f}")
         stage1_val_results.append(result)
 
-        # 该折模型对测试集预测 (被试级)
         fold_preds = predict_test_subject_level(encoder, classifier, test_loader, device)
         all_depression_preds.append(fold_preds)
 
-    # K 折投票 → 最终抑郁症预测
+    # K 折投票
     final_depression = {}
     all_sids = sorted(all_depression_preds[0].keys()) if all_depression_preds else []
     for sid in all_sids:
@@ -206,35 +193,15 @@ def train_stage1(all_subjects, depression_labels, test_loader, config, logger):
     n_h, n_d = 0, 0
     for sid in sorted(final_depression.keys()):
         label = final_depression[sid]
-        if label == 0:
-            n_h += 1
-        else:
-            n_d += 1
+        if label == 0: n_h += 1
+        else: n_d += 1
         logger.info(f"  {sid}: {'Healthy' if label == 0 else 'Depressed'}")
     logger.info(f"  → {n_h} Healthy, {n_d} Depressed")
 
-    # 按预测分组
     healthy_tests = [sid for sid, v in final_depression.items() if v == 0]
     depressed_tests = [sid for sid, v in final_depression.items() if v == 1]
 
-    # Stage 1 报告: 按组准确率
-    if stage1_val_results:
-        healthy_vals = [r for r in stage1_val_results if r['depression_label'] == 0]
-        depressed_vals = [r for r in stage1_val_results if r['depression_label'] == 1]
-        logger.info(f"\n{'='*60}")
-        logger.info(f"Stage 1 验证集报告")
-        logger.info(f"{'='*60}")
-        if healthy_vals:
-            h_accs = [r['best_accuracy'] for r in healthy_vals]
-            logger.info(f"  Healthy (n={len(healthy_vals)}): Mean={np.mean(h_accs):.4f} ± {np.std(h_accs):.4f}, "
-                         f"Max={np.max(h_accs):.4f}, Min={np.min(h_accs):.4f}")
-        if depressed_vals:
-            d_accs = [r['best_accuracy'] for r in depressed_vals]
-            logger.info(f"  Depressed (n={len(depressed_vals)}): Mean={np.mean(d_accs):.4f} ± {np.std(d_accs):.4f}, "
-                         f"Max={np.max(d_accs):.4f}, Min={np.min(d_accs):.4f}")
-        logger.info(f"{'='*60}")
-
-    return final_depression, healthy_tests, depressed_tests
+    return final_depression, healthy_tests, depressed_tests, stage1_val_results
 
 
 # ================================================================
@@ -242,29 +209,24 @@ def train_stage1(all_subjects, depression_labels, test_loader, config, logger):
 # ================================================================
 def train_stage2(group_subjects, group_name, test_sids, test_loader, config, logger):
     """
-    Stage 2: 对指定组的被试做 K折CV 情绪分类, 每折对测试集推理。
-
-    参数:
-        group_subjects: {sid: (features, emotion_labels)}
-        group_name: "Healthy" / "Depressed"
-        test_sids: 要用这个组预测的测试被试 ID 列表
+    Stage 2: K折CV 情绪分类, 每折对测试集推理。
 
     返回:
-        test_emotion_preds: [{sid: [trial_preds]}] 各折预测
+        all_test_preds: K折预测 [{sid: [trial_preds]}]
+        all_val_results: 验证结果列表
     """
     logger.info(f"\n{'='*60}")
     logger.info(f"Stage 2-{group_name}: 情绪分类 ({len(group_subjects)} 被试)")
     logger.info(f"{'='*60}")
 
     if len(group_subjects) < 3:
-        logger.info(f"被试太少, 跳过 K折CV ({len(group_subjects)} subjects)")
-        return []
+        logger.info(f"被试太少, 跳过 ({len(group_subjects)} subjects)")
+        return [], []
 
     train_cfg = config.get('training', {})
     data_cfg = config.get('data', {})
     device = _get_device(config)
 
-    # K 折数自适应
     n_folds_stage2 = min(data_cfg.get('n_folds', 5), len(group_subjects))
     cv_loader = CrossSubjectDataLoader(
         group_subjects,
@@ -284,13 +246,11 @@ def train_stage2(group_subjects, group_name, test_sids, test_loader, config, log
         encoder, classifier, domain_disc, contrastive_head = build_models(config, n_classes=2)
         trainer = DANNTrainer(encoder, classifier, domain_disc, contrastive_head,
                               config, logger)
-        # Stage2 val subjects: 0=healthy, 1=depressed
         tgt_dep_label = 0 if group_name == "Healthy" else 1
         result = trainer.train_fold(src_loader, tgt_loader, target_id, fold_idx,
                                     depression_label=tgt_dep_label)
         all_val_results.append(result)
 
-        # 只对属于该组的测试被试推理
         fold_test_preds = {}
         for sid in test_sids:
             preds = predict_test_trial_level(encoder, classifier, test_loader, device)
@@ -299,19 +259,24 @@ def train_stage2(group_subjects, group_name, test_sids, test_loader, config, log
         logger.info(f"Stage2-{group_name} Fold {fold_idx}: Val={result['best_accuracy']:.4f}, "
                      f"Test推理={len(test_sids)} 被试")
 
-    # Stage 2 per-group report
-    if all_val_results:
-        accs = [r['best_accuracy'] for r in all_val_results]
-        logger.info(f"\nStage 2-{group_name} 验证集报告 ({len(all_val_results)} 折)")
-        logger.info(f"  Mean={np.mean(accs):.4f} ± {np.std(accs):.4f}, "
-                     f"Max={np.max(accs):.4f}, Min={np.min(accs):.4f}")
-
     return all_test_preds, all_val_results
 
 
-# ================================================================
-# Main
-# ================================================================
+def _print_acc_report(logger, title, results):
+    """打印一组验证结果, 按 healthy/depressed 分组"""
+    healthy_vals = [r for r in results if r['depression_label'] == 0]
+    depressed_vals = [r for r in results if r['depression_label'] == 1]
+    logger.info(f"  --- {title} ---")
+    if healthy_vals:
+        h = [r['best_accuracy'] for r in healthy_vals]
+        logger.info(f"  Healthy  (n={len(healthy_vals)}): Mean={np.mean(h):.4f} ± {np.std(h):.4f}, "
+                     f"Max={np.max(h):.4f}, Min={np.min(h):.4f}")
+    if depressed_vals:
+        d = [r['best_accuracy'] for r in depressed_vals]
+        logger.info(f"  Depressed (n={len(depressed_vals)}): Mean={np.mean(d):.4f} ± {np.std(d):.4f}, "
+                     f"Max={np.max(d):.4f}, Min={np.min(d):.4f}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default='configs/config.yaml')
@@ -392,14 +357,13 @@ def main():
     # ================================================================
     # Step 4: Stage 1 — 抑郁症分类 + 路由
     # ================================================================
-    final_depression, healthy_tests, depressed_tests = train_stage1(
+    final_depression, healthy_tests, depressed_tests, stage1_val_results = train_stage1(
         all_subjects, depression_labels, test_loader, config, logger,
     )
 
     # ================================================================
-    # Step 5: Stage 2 — 按组情绪分类
+    # Step 5: Stage 2 — 按组情绪分类 (K折CV)
     # ================================================================
-    # 按抑郁症标签拆分训练数据 (只使用原始 60 人, 不含 pseudo)
     healthy_train = {sid: val for sid, val in all_subjects.items()
                      if not sid.startswith('pseudo_') and depression_labels.get(sid, -1) == 0}
     depressed_train = {sid: val for sid, val in all_subjects.items()
@@ -411,54 +375,38 @@ def main():
                  f"Depressed→{len(depressed_tests)} subjects")
 
     all_test_preds_stage2 = []
-    stage2_all_val_results = []  # 用于最终报告
+    stage2_all_val_results = []
 
-    # Stage 2-A: 正常人情绪分类
-    if healthy_train and healthy_tests:
-        preds_a, val_results_a = train_stage2(healthy_train, "Healthy", healthy_tests,
-                                                test_loader, config, logger)
+    if healthy_train:
+        preds_a, val_a = train_stage2(healthy_train, "Healthy", healthy_tests,
+                                       test_loader, config, logger)
         all_test_preds_stage2.extend(preds_a)
-        stage2_all_val_results.extend(val_results_a)
+        stage2_all_val_results.extend(val_a)
 
-    # Stage 2-B: 抑郁症情绪分类
-    if depressed_train and depressed_tests:
-        preds_b, val_results_b = train_stage2(depressed_train, "Depressed", depressed_tests,
-                                                test_loader, config, logger)
+    if depressed_train:
+        preds_b, val_b = train_stage2(depressed_train, "Depressed", depressed_tests,
+                                       test_loader, config, logger)
         all_test_preds_stage2.extend(preds_b)
-        stage2_all_val_results.extend(val_results_b)
+        stage2_all_val_results.extend(val_b)
 
     # ================================================================
-    # Step 6: 最终总结报告
+    # Step 6: 最终总结报告 (Stage 1 + Stage 2 一起)
     # ================================================================
     logger.info(f"\n{'#'*60}")
     logger.info(f"#  训练总结报告")
     logger.info(f"{'#'*60}")
 
-    # Stage 2 情绪分类按组评估
-    if stage2_all_val_results:
-        healthy_stage2 = [r for r in stage2_all_val_results if r['depression_label'] == 0]
-        depressed_stage2 = [r for r in stage2_all_val_results if r['depression_label'] == 1]
+    logger.info(f"\n{'='*60}")
+    logger.info("验证集准确率汇总")
+    logger.info(f"{'='*60}")
 
-        logger.info(f"\n{'='*60}")
-        logger.info(f"Stage 2 情绪分类 — 验证集准确率")
-        logger.info(f"{'='*60}")
+    _print_acc_report(logger, "Stage 1 — 抑郁症分类", stage1_val_results)
+    _print_acc_report(logger, "Stage 2 — 情绪分类", stage2_all_val_results)
 
-        if healthy_stage2:
-            h_accs = [r['best_accuracy'] for r in healthy_stage2]
-            logger.info(f"  Healthy 组 (n={len(healthy_stage2)} folds):")
-            logger.info(f"    Mean = {np.mean(h_accs):.4f} ± {np.std(h_accs):.4f}")
-            logger.info(f"    Max  = {np.max(h_accs):.4f}, Min = {np.min(h_accs):.4f}")
-
-        if depressed_stage2:
-            d_accs = [r['best_accuracy'] for r in depressed_stage2]
-            logger.info(f"  Depressed 组 (n={len(depressed_stage2)} folds):")
-            logger.info(f"    Mean = {np.mean(d_accs):.4f} ± {np.std(d_accs):.4f}")
-            logger.info(f"    Max  = {np.max(d_accs):.4f}, Min = {np.min(d_accs):.4f}")
-
-        logger.info(f"{'='*60}")
+    logger.info(f"\n{'='*60}")
 
     # ================================================================
-    # Step 7: K 折投票 → predictions.csv
+    # Step 7: K折投票 → predictions.csv
     # ================================================================
     if all_test_preds_stage2:
         all_sids = sorted(test_loader.get_subject_ids())
@@ -466,10 +414,7 @@ def main():
         with open(output_path, 'w') as f:
             f.write("Subject," + ",".join(f"Trial{i+1}" for i in range(8)) + "\n")
             for sid in all_sids:
-                fold_votes = []
-                for fp in all_test_preds_stage2:
-                    if sid in fp:
-                        fold_votes.append(fp[sid])
+                fold_votes = [fp.get(sid, [0]*8) for fp in all_test_preds_stage2 if sid in fp]
                 if fold_votes:
                     final = []
                     for t in range(8):
@@ -481,7 +426,7 @@ def main():
 
         logger.info(f"\n测试集分类结果 → {output_path}")
         for sid in all_sids:
-            fold_votes = [fp.get(sid, [0]*8) for fp in all_test_preds_stage2]
+            fold_votes = [fp.get(sid, [0]*8) for fp in all_test_preds_stage2 if sid in fp]
             final = []
             for t in range(8):
                 tv = [fv[t] for fv in fold_votes]

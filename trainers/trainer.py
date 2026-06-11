@@ -97,10 +97,11 @@ class DANNTrainer:
         lw = config.get('loss_weights', {})
         domain_w = self.stage_config.get('domain_weight', lw.get('domain', 0.1))
         class_w = self.stage_config.get('class_weight', None)
+        con_w = self.stage_config.get('contrastive_weight', lw.get('contrastive', 0.05))
         self.criterion = DANNTotalLoss(
             cls_weight=lw.get('cls', 1.0),
             domain_weight=domain_w,
-            contrastive_weight=lw.get('contrastive', 0.05),
+            contrastive_weight=con_w,
             temperature=config.get('contrastive', {}).get('temperature', 0.1),
             class_weight=class_w,
         )

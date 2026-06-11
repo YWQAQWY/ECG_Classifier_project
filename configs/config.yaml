@@ -16,8 +16,8 @@ data:
   test_trial_length: 2500
 
   # 滑动窗口参数
-  window_size: 250
-  stride: 125
+  window_size: 500                # 2秒窗口 (更多 temporal context)
+  stride: 250                     # 1秒步长 (非重叠, 减少冗余)
 
   # DE 特征频段定义 (Hz)
   frequency_bands:
@@ -29,11 +29,10 @@ data:
   # 降采样
   downsample:
     enabled: true                # 是否启用降采样
-    ratio: 0.5                   # 每个被试保留比例 (1.0=不降采样)
+    ratio: 0.8                   # 保留80% (减少冗余但保留domain多样性)
 
-  # 训练/测试时长匹配 (P0优化)
-  match_test_duration: true      # 训练trial切为10s短段, 匹配测试集条件
-  test_segment_length: 2500      # 测试集每段10秒=2500采样点
+  # 恢复50s整段训练 (不做10s切分)
+  match_test_duration: false
 
   # 归一化: z-score (每个被试独立)
   normalization: "zscore"
@@ -84,6 +83,7 @@ training:
 
   epochs: 100
   stage1_epochs: 100            # Stage 1 (抑郁症分类) 训练轮数
+  adapt_epochs: 30              # 测试被试域适应轮数 (逐个LOSO)
   batch_size: 512
 
   # 学习率调度
